@@ -1,6 +1,9 @@
 pub mod help;
+pub mod merge;
 pub mod preview;
 pub mod preview_view;
+pub mod prune;
 pub mod remove;
+pub mod search_view;
 pub mod status;
 pub mod table;

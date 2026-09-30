@@ -6,6 +6,7 @@
 //! JSON Schema worktrunk publishes.
 
 pub mod app;
+pub mod search;
 pub mod ui;
 pub mod watch;
 pub mod wt;

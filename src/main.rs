@@ -9,14 +9,18 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::{Frame, Terminal};
 use std::io::Stdout;
 use std::path::PathBuf;
 use std::time::Duration;
-use wt_tui::app::{App, Mode, NoticeKind, REFRESH_INTERVAL};
+use wt_tui::app::{
+    App, MergeRequest, Mode, NoticeKind, Pending, REFRESH_INTERVAL, SearchRequest, View,
+};
+use wt_tui::search;
 use wt_tui::ui;
-use wt_tui::{watch, wt};
+use wt_tui::watch;
+use wt_tui::wt;
 
 /// Background results arriving from spawned work.
 enum Event_ {
@@ -24,17 +28,25 @@ enum Event_ {
     Created(Result<wt::model::SwitchResult, String>, String),
     Removed(Result<Vec<wt::model::RemoveResult>, String>, String),
     Preview(String),
+    SearchDone(search::Results, Duration),
+    SearchContext(String),
+    MergeDone(Result<wt::command::MergeOutcome, String>, MergeRequest),
+    PrunePreview(
+        Result<Vec<wt::command::PruneCandidate>, String>,
+        Option<String>,
+    ),
+    Pruned(Result<String, String>, String),
 }
 
 type Backend = ratatui::backend::CrosstermBackend<Stdout>;
 
-#[derive(Debug, clap::Parser)]
+#[derive(Debug, Parser)]
 #[command(
     name = "wt-tui",
     about = "A TUI dashboard for worktrunk worktrees",
-    long_about = "wt-tui watches worktrunk worktrees and lets you browse, filter, preview, \
-                  create, and remove them. It reads worktrunk through its documented JSON \
-                  output, so it stays current as worktrunk gains features.\n\n\
+    long_about = "wt-tui watches worktrunk worktrees and lets you browse, search across \
+                  worktrees, create, merge, and remove them. It reads worktrunk through its \
+                  documented JSON output, so it stays current as worktrunk gains features.\n\n\
                   Because it is a `wt-tui` binary on PATH, worktrunk exposes it as `wt tui`."
 )]
 struct Cli {
@@ -100,8 +112,6 @@ async fn run(cli: Cli, repo: PathBuf) -> std::process::ExitCode {
         wt::ListScope::WORKTREES
     };
 
-    // Background results channel, created up front so the first preview load can
-    // be queued before the loop starts.
     let (events, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Event_>();
     let mut input_rx = spawn_input();
 
@@ -121,7 +131,6 @@ async fn run(cli: Cli, repo: PathBuf) -> std::process::ExitCode {
         }
     };
 
-    // Prime the first load and the first preview.
     let _ = watch_tx.send(());
     if let Some(path) = app.selected_path() {
         spawn_preview(&mut app, path, &events);
@@ -142,54 +151,40 @@ async fn run(cli: Cli, repo: PathBuf) -> std::process::ExitCode {
             break;
         }
 
-        // Act on work queued by the key handler.
-        if let Some(branch) = app.pending.create.take() {
-            app.set_notice(format!("creating {branch}…"), NoticeKind::Info);
-            let repo = repo.clone();
-            let tx = events.clone();
-            tokio::spawn(async move {
-                let result = wt::command::create(&repo, &branch, None).await;
-                let _ = tx.send(Event_::Created(result, branch));
-            });
-        }
-        if let Some((branch, force)) = app.pending.remove.take() {
-            app.set_notice(format!("removing {branch}…"), NoticeKind::Info);
-            let repo = repo.clone();
-            let tx = events.clone();
-            tokio::spawn(async move {
-                let result = wt::command::remove(&repo, &branch, force).await;
-                let _ = tx.send(Event_::Removed(result, branch));
-            });
-        }
-        if let Some((editor, path)) = app.pending.editor.take() {
-            // Give the editor the terminal, then take it back.
+        let editor_request = dispatch_pending(&mut app, &repo, scope, &events);
+
+        // The editor owns the terminal, so hand it over and take it back. This
+        // cannot live in `dispatch_pending`, which has no terminal handle.
+        if let Some((editor, path)) = editor_request {
             let _ = restore(&mut terminal);
             let status = std::process::Command::new(&editor).arg(&path).status();
             let _ = setup_with(&mut terminal);
             match status {
-                Ok(s) if s.success() => app.set_notice("editor closed", NoticeKind::Info),
+                Ok(s) if s.success() => {
+                    app.set_notice(format!("closed {editor}"), NoticeKind::Info)
+                }
                 Ok(s) => app.set_notice(format!("{editor} exited {s}"), NoticeKind::Error),
                 Err(e) => app.set_notice(format!("could not run {editor}: {e}"), NoticeKind::Error),
             }
         }
-        if app.pending.preview_stale {
-            app.pending.preview_stale = false;
-            if let Some(path) = app.selected_path() {
-                spawn_preview(&mut app, path.clone(), &events);
-                preview_for = Some(path);
-            }
-        }
-        if app.pending.take_refresh() {
-            let _ = watch_tx.send(());
-        }
 
         // Load a preview when the selection moved to a different worktree.
         if app.mode == Mode::Normal
+            && app.view == View::Worktrees
             && let Some(path) = app.selected_path()
             && preview_for.as_ref() != Some(&path)
         {
             spawn_preview(&mut app, path.clone(), &events);
             preview_for = Some(path);
+        }
+
+        // Load the file around the selected search hit.
+        if app.view == View::Search
+            && app.search.context_body.is_empty()
+            && let Some(hit) = app.selected_hit().cloned()
+            && let Some(path) = worktree_for_branch(&app, hit.worktrees.first())
+        {
+            spawn_search_context(&app, path, &hit.rel_path, &events);
         }
 
         tokio::select! {
@@ -208,73 +203,25 @@ async fn run(cli: Cli, repo: PathBuf) -> std::process::ExitCode {
                 if !fetching {
                     fetching = true;
                     app.fetching = true;
-                    fetch(&repo, scope, &events);
+                    fetch(&repo, scope, false, &events);
                 }
             }
 
             _ = ticker.tick() => {
-                // Safety net for missed watch notifications.
+                // Safety net for missed watch notifications. Never `--full`
+                // here: it reaches the forge over the network.
                 if !fetching {
                     fetching = true;
                     app.fetching = true;
-                    fetch(&repo, scope, &events);
+                    fetch(&repo, scope, false, &events);
                 }
             }
 
             maybe = event_rx.recv() => {
                 let Some(ev) = maybe else { break };
-                match ev {
-                    Event_::List(result) => {
-                        fetching = false;
-                        app.fetching = false;
-                        match result {
-                            Ok(envelope) => {
-                                let default_branch =
-                                    envelope.repo.as_ref().and_then(|r| r.default_branch.clone());
-                                app.apply(envelope, default_branch);
-                            }
-                            Err(e) => app.set_error(e.to_string()),
-                        }
-                    }
-                    Event_::Created(result, branch) => {
-                        app.mode = Mode::Normal;
-                        match result {
-                            Ok(res) => {
-                                let path = res.path.unwrap_or_default();
-                                app.set_notice(format!("created {branch} @ {path}"), NoticeKind::Info);
-                            }
-                            Err(e) => {
-                                app.set_notice(format!("could not create {branch}: {e}"), NoticeKind::Error);
-                            }
-                        }
-                        // Refresh now rather than waiting for the next tick.
-                        fetching = true;
-                        app.fetching = true;
-                        fetch(&repo, scope, &events);
-                    }
-                    Event_::Removed(result, branch) => {
-                        app.mode = Mode::Normal;
-                        match result {
-                            Ok(results) => match results.first() {
-                                Some(first) => {
-                                    let (text, kind) = ui::remove::removal_summary(first);
-                                    app.set_notice(text, kind);
-                                }
-                                None => app.set_notice(
-                                    format!("removal of {branch} reported no result"),
-                                    NoticeKind::Error,
-                                ),
-                            },
-                            Err(e) => {
-                                app.set_notice(format!("could not remove {branch}: {e}"), NoticeKind::Error);
-                            }
-                        }
-                        fetching = true;
-                        app.fetching = true;
-                        fetch(&repo, scope, &events);
-                    }
-                    Event_::Preview(body) => app.preview.finish_load(body),
-                }
+                fetching = false;
+                app.fetching = false;
+                handle_event(&mut app, ev, &repo, scope, &mut preview_for, &events);
             }
         }
     }
@@ -284,20 +231,325 @@ async fn run(cli: Cli, repo: PathBuf) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+fn dispatch_pending(
+    app: &mut App,
+    repo: &PathBuf,
+    scope: wt::ListScope,
+    events: &tokio::sync::mpsc::UnboundedSender<Event_>,
+) -> Option<(String, PathBuf)> {
+    let Pending {
+        create,
+        remove,
+        editor,
+        refresh,
+        preview_stale,
+        search: search_request,
+        merge,
+        prune_preview,
+        prune,
+        prune_age,
+        fetch_ci,
+    } = std::mem::take(&mut app.pending);
+
+    if let Some(branch) = create {
+        app.set_notice(format!("creating {branch}…"), NoticeKind::Info);
+        let repo = repo.clone();
+        let tx = events.clone();
+        tokio::spawn(async move {
+            let result = wt::command::create(&repo, &branch, None).await;
+            let _ = tx.send(Event_::Created(result, branch));
+        });
+    }
+
+    if let Some((branch, force)) = remove {
+        app.set_notice(format!("removing {branch}…"), NoticeKind::Info);
+        let repo = repo.clone();
+        let tx = events.clone();
+        tokio::spawn(async move {
+            let result = wt::command::remove(&repo, &branch, force).await;
+            let _ = tx.send(Event_::Removed(result, branch));
+        });
+    }
+
+    if let Some(request) = search_request {
+        run_search(app, request, events);
+    }
+
+    if let Some(request) = merge {
+        app.set_notice(
+            format!("merging {} into {}…", request.branch, request.target),
+            NoticeKind::Info,
+        );
+        let tx = events.clone();
+        tokio::spawn(async move {
+            let result =
+                wt::command::merge(&request.worktree, &request.target, request.keep_worktree).await;
+            let _ = tx.send(Event_::MergeDone(result, request));
+        });
+    }
+
+    if prune_preview {
+        let repo_path = repo.clone();
+        let tx = events.clone();
+        tokio::spawn(async move {
+            let result = wt::command::prune_preview(&repo_path, prune_age.as_deref()).await;
+            let _ = tx.send(Event_::PrunePreview(result, prune_age));
+        });
+    }
+
+    if let Some(min_age) = prune {
+        app.set_notice(format!("pruning (min-age {min_age})…"), NoticeKind::Info);
+        let repo_path = repo.clone();
+        let tx = events.clone();
+        tokio::spawn(async move {
+            let result = wt::command::prune(&repo_path, Some(&min_age)).await;
+            let _ = tx.send(Event_::Pruned(result, min_age));
+        });
+    }
+
+    if fetch_ci {
+        // Recorded before the load so the column says "not fetched" rather than
+        // "no checks" while the request is in flight.
+        app.ci_attempted = true;
+        fetch(repo, scope, true, events);
+    }
+
+    if preview_stale {
+        app.pending.preview_stale = true;
+        if let Some(path) = app.selected_path() {
+            spawn_preview(app, path, events);
+        }
+    }
+
+    if refresh {
+        fetch(repo, scope, false, events);
+    }
+
+    editor
+}
+
+/// Handle a background result.
+fn handle_event(
+    app: &mut App,
+    ev: Event_,
+    repo: &PathBuf,
+    scope: wt::ListScope,
+    preview_for: &mut Option<PathBuf>,
+    events: &tokio::sync::mpsc::UnboundedSender<Event_>,
+) {
+    match ev {
+        Event_::List(result) => match result {
+            Ok(envelope) => {
+                let default_branch = envelope
+                    .repo
+                    .as_ref()
+                    .and_then(|r| r.default_branch.clone());
+                app.apply(envelope, default_branch);
+            }
+            Err(e) => app.set_error(e.to_string()),
+        },
+
+        Event_::Created(result, branch) => {
+            app.mode = Mode::Normal;
+            match result {
+                Ok(res) => {
+                    let path = res.path.unwrap_or_default();
+                    app.set_notice(format!("created {branch} @ {path}"), NoticeKind::Info);
+                }
+                Err(e) => {
+                    app.set_notice(format!("could not create {branch}: {e}"), NoticeKind::Error)
+                }
+            }
+            // A new branch may sort before the current selection.
+            *preview_for = None;
+            fetch(repo, scope, false, events);
+        }
+
+        Event_::Removed(result, branch) => {
+            app.mode = Mode::Normal;
+            match result {
+                Ok(results) => match results.first() {
+                    Some(first) => {
+                        let (text, kind) = ui::remove::removal_summary(first);
+                        app.set_notice(text, kind);
+                    }
+                    None => app.set_notice(
+                        format!("removal of {branch} reported no result"),
+                        NoticeKind::Error,
+                    ),
+                },
+                Err(e) => {
+                    app.set_notice(format!("could not remove {branch}: {e}"), NoticeKind::Error)
+                }
+            }
+            *preview_for = None;
+            fetch(repo, scope, false, events);
+        }
+
+        Event_::Preview(body) => app.preview.finish_load(body),
+
+        Event_::SearchDone(results, elapsed) => {
+            app.search.running = false;
+            app.search.elapsed = Some(elapsed);
+            app.search.selected = 0;
+            app.search.scroll = 0;
+            app.search.context_body.clear();
+
+            if let Some(error) = &results.error {
+                app.set_notice(error.clone(), NoticeKind::Error);
+            } else if results.is_empty() {
+                let scope_note = if results.covered() == 0 {
+                    " (no worktrees to search)"
+                } else {
+                    ""
+                };
+                app.set_notice(format!("no matches{scope_note}"), NoticeKind::Info);
+            }
+            app.search.results = results;
+        }
+
+        Event_::SearchContext(body) => app.search.context_body = body,
+
+        Event_::MergeDone(result, request) => {
+            app.mode = Mode::Normal;
+            match result {
+                Ok(outcome) => {
+                    // A conflicted merge can still report success, so the
+                    // repository state is checked rather than trusted.
+                    if outcome.left_operation_in_progress(&request.worktree) {
+                        app.set_notice(
+                            format!(
+                                "merge of {} left a git operation in progress — resolve it in {}",
+                                request.branch,
+                                request.worktree.display()
+                            ),
+                            NoticeKind::Error,
+                        );
+                    } else if let Some(result) = outcome.result {
+                        let mut notes = Vec::new();
+                        if result.committed {
+                            notes.push("committed changes");
+                        }
+                        if result.squashed {
+                            notes.push("squashed");
+                        }
+                        if result.rebased {
+                            notes.push("rebased");
+                        }
+                        if result.removed {
+                            notes.push("removed the worktree");
+                        }
+                        let detail = if notes.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", notes.join(", "))
+                        };
+                        app.set_notice(
+                            format!("merged {} into {}{detail}", request.branch, request.target),
+                            NoticeKind::Info,
+                        );
+                    } else {
+                        app.set_notice(
+                            format!(
+                                "merge of {} did not complete: {}",
+                                request.branch,
+                                tail(&outcome.stderr)
+                            ),
+                            NoticeKind::Error,
+                        );
+                    }
+                }
+                Err(e) => app.set_notice(format!("merge failed: {e}"), NoticeKind::Error),
+            }
+            *preview_for = None;
+            fetch(repo, scope, false, events);
+        }
+
+        Event_::PrunePreview(result, min_age) => match result {
+            Ok(candidates) => {
+                let age = min_age.unwrap_or_else(|| "1d".to_string());
+                app.mode = Mode::ConfirmPrune {
+                    candidates,
+                    min_age: age,
+                };
+            }
+            Err(e) => {
+                app.mode = Mode::Normal;
+                app.set_notice(format!("could not preview prune: {e}"), NoticeKind::Error);
+            }
+        },
+
+        Event_::Pruned(result, min_age) => {
+            app.mode = Mode::Normal;
+            match result {
+                Ok(_) => app.set_notice(format!("pruned (min-age {min_age})"), NoticeKind::Info),
+                Err(e) => app.set_notice(format!("prune failed: {e}"), NoticeKind::Error),
+            }
+            *preview_for = None;
+            fetch(repo, scope, false, events);
+        }
+    }
+}
+
+/// Run a search on a blocking thread, since it is CPU-bound.
+fn run_search(
+    app: &App,
+    request: SearchRequest,
+    events: &tokio::sync::mpsc::UnboundedSender<Event_>,
+) {
+    let targets = app.search_targets();
+    let tx = events.clone();
+    let query = request.query.clone();
+    let options = request.options;
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let results = search::search(&query, &targets, options);
+        let _ = tx.send(Event_::SearchDone(results, started.elapsed()));
+    });
+}
+
+/// The worktree path for a branch name, if it is still listed.
+fn worktree_for_branch(app: &App, branch: Option<&String>) -> Option<PathBuf> {
+    let branch = branch?;
+    app.rows
+        .iter()
+        .find(|item| item.branch.as_deref() == Some(branch.as_str()))
+        .and_then(|item| item.worktree.as_ref())
+        .and_then(|w| w.path.as_deref())
+        .map(PathBuf::from)
+}
+
+/// Read a file so the selected hit's surrounding lines can be shown.
+fn spawn_search_context(
+    app: &App,
+    worktree: PathBuf,
+    rel_path: &str,
+    events: &tokio::sync::mpsc::UnboundedSender<Event_>,
+) {
+    let _ = app;
+    let path = worktree.join(rel_path);
+    let tx = events.clone();
+    tokio::task::spawn_blocking(move || {
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = tx.send(Event_::SearchContext(body));
+    });
+}
+
 /// Kick off a `wt list` load without blocking the loop.
 ///
-/// The path is taken by reference and cloned in, because the spawned future
-/// must be `'static` and cannot borrow from the event loop.
+/// `full` adds PR/CI data, which reaches the forge over the network, so it is
+/// only ever requested explicitly.
 #[allow(clippy::ptr_arg, reason = "the repo is cloned into a spawned task")]
 fn fetch(
     repo: &PathBuf,
     scope: wt::ListScope,
+    full: bool,
     events: &tokio::sync::mpsc::UnboundedSender<Event_>,
 ) {
     let repo = repo.clone();
     let tx = events.clone();
     tokio::spawn(async move {
-        let result = wt::command::list(&repo, scope).await;
+        let result = wt::command::list_with(&repo, scope, full).await;
         let _ = tx.send(Event_::List(result));
     });
 }
@@ -335,9 +587,6 @@ fn spawn_input() -> tokio::sync::mpsc::UnboundedReceiver<std::io::Result<Event>>
 }
 
 /// Start a background `git` run for the preview pane.
-///
-/// The body is produced here rather than shipping a `std::process::Output`
-/// across the channel, because the only thing the UI needs is text.
 fn spawn_preview(app: &mut App, path: PathBuf, tx: &tokio::sync::mpsc::UnboundedSender<Event_>) {
     let args = ui::preview::Preview::command(app.preview.tab, &path);
     app.preview.begin_load(path);
@@ -347,7 +596,7 @@ fn spawn_preview(app: &mut App, path: PathBuf, tx: &tokio::sync::mpsc::Unbounded
             Ok(output) if output.status.success() => {
                 let out = String::from_utf8_lossy(&output.stdout).into_owned();
                 if out.trim().is_empty() {
-                    "(no output — is this worktree clean and up to date?)".to_string()
+                    "(no output \u{2014} is this worktree clean and up to date?)".to_string()
                 } else {
                     out
                 }
@@ -367,6 +616,17 @@ fn spawn_preview(app: &mut App, path: PathBuf, tx: &tokio::sync::mpsc::Unbounded
     });
 }
 
+/// The last line of a command's stderr, for a one-line status message.
+fn tail(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("no detail")
+        .trim()
+        .to_string()
+}
+
 fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -380,12 +640,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.initial_loading() {
         ui::status::render_loading(frame, body);
     } else {
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(body);
-        ui::table::render(frame, panes[0], app);
-        ui::preview_view::render(frame, panes[1], app);
+        draw_body(frame, body, app);
     }
 
     ui::status::render(frame, chunks[1], app);
@@ -393,9 +648,33 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         ui::help::render(frame, body);
     }
-    if matches!(app.mode, Mode::ConfirmRemove { .. }) {
-        ui::remove::render(frame, body, app);
+
+    // Dialogs last, so they sit above everything.
+    match app.mode {
+        Mode::ConfirmRemove { .. } => ui::remove::render(frame, body, app),
+        Mode::ConfirmMerge { .. } => ui::merge::render(frame, body, app),
+        Mode::ConfirmPrune { .. } => ui::prune::render(frame, body, app),
+        _ => {}
     }
+}
+
+fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.view == View::Search {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(area);
+        ui::search_view::render_results(frame, panes[0], app);
+        ui::search_view::render_match_context(frame, panes[1], app);
+        return;
+    }
+
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(area);
+    ui::table::render(frame, panes[0], app);
+    ui::preview_view::render(frame, panes[1], app);
 }
 
 fn setup() -> std::io::Result<Terminal<Backend>> {

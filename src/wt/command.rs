@@ -9,6 +9,7 @@
 //! fields for free.
 
 use super::model::{Envelope, PayloadError, RemoveResult, SwitchResult, parse_list_json};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -119,12 +120,20 @@ async fn run(mut cmd: Command) -> Result<(String, String), String> {
 
 /// Fetch worktree state as a schema-2 envelope.
 pub async fn list(repo: &Path, scope: ListScope) -> Result<Envelope, ListError> {
+    list_with(repo, scope, scope.full).await
+}
+
+/// Fetch worktree state, choosing whether to collect PR/CI data.
+///
+/// `full` is separate from `scope.full` so a caller can ask for `--full`
+/// without the scope flag meaning anything else.
+pub async fn list_with(repo: &Path, scope: ListScope, full: bool) -> Result<Envelope, ListError> {
     let mut cmd = wt_command(repo);
     cmd.args(["list", "--format=json"]);
     if scope.branches {
         cmd.arg("--branches");
     }
-    if scope.full {
+    if full {
         cmd.arg("--full");
     }
 
@@ -152,6 +161,180 @@ pub async fn create(repo: &Path, branch: &str, base: Option<&str>) -> Result<Swi
 
     let (stdout, _) = run(cmd).await?;
     extract_json(&stdout)
+}
+
+/// Merge a branch into `target`.
+///
+/// # Direction matters
+///
+/// `wt merge` merges **the current branch into the target**. Running
+/// `wt merge <branch>` from the repository root therefore merges the *root's*
+/// branch *into* `<branch>` — the opposite of what a user pressing "merge" on a
+/// row in the table means. Verified: from the main worktree, `wt merge
+/// feature-x` moved main's commits onto feature-x and left feature-x at
+/// ahead=0.
+///
+/// So the worktree is passed as `-C`, making the row's branch the current one:
+/// `wt -C <the row's worktree> merge <target>`.
+///
+/// Returns the parsed result *and* whether the command reported success, because
+/// the two disagree on a conflicted merge — see [`MergeOutcome`].
+pub async fn merge(
+    worktree_path: &Path,
+    target: &str,
+    keep_worktree: bool,
+) -> Result<MergeOutcome, String> {
+    let mut cmd = wt_command(worktree_path);
+    cmd.args(["merge", target, "-y", "--format=json"]);
+    if keep_worktree {
+        cmd.arg("--no-remove");
+    }
+
+    // A conflicted merge is a legitimate outcome, not a failure to report: the
+    // user needs to be told that a git operation is waiting on them. So a
+    // non-zero exit is folded into the outcome rather than turned into an `Err`,
+    // which would discard exactly the information that matters. `Err` is
+    // reserved for the command failing to run at all.
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("failed to run `{}`: {e}", wt_binary().display()))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    // Worktrunk writes its progress and results to stderr when stderr is not a
+    // terminal, so both streams are searched for the payload.
+    let result: Option<MergeResult> = extract_json(&stdout)
+        .ok()
+        .or_else(|| extract_json(&stderr).ok());
+
+    Ok(MergeOutcome {
+        succeeded: result.is_some(),
+        result,
+        stderr,
+        exit_ok: out.status.success(),
+    })
+}
+
+/// `wt merge --format=json` reports a single object (unlike `wt remove`, which
+/// reports an array).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MergeResult {
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Whether worktrunk created a commit from uncommitted changes.
+    #[serde(default)]
+    pub committed: bool,
+    #[serde(default)]
+    pub rebased: bool,
+    /// Whether the worktree and branch were removed afterwards.
+    #[serde(default)]
+    pub removed: bool,
+    #[serde(default)]
+    pub squashed: bool,
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+/// One row of `wt step prune --dry-run --format=json`.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct PruneCandidate {
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Why worktrunk considers this branch integrated.
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Present when the row describes a branch with no worktree.
+    #[serde(default)]
+    pub pruned: Option<bool>,
+}
+
+/// The outcome of a merge attempt.
+#[derive(Debug, Clone, Default)]
+pub struct MergeOutcome {
+    pub result: Option<MergeResult>,
+    pub stderr: String,
+    /// True when worktrunk reported a completed merge.
+    pub succeeded: bool,
+    /// Whether the process exited cleanly.
+    ///
+    /// `false` with no result is the normal shape of a conflicted merge, which
+    /// leaves the repository mid-operation for the user to resolve.
+    pub exit_ok: bool,
+}
+
+impl MergeOutcome {
+    /// Whether worktrunk left a git operation in progress, which is the state a
+    /// conflicted merge can leave behind and which the user must resolve.
+    ///
+    /// Verified: a merge that hit a conflict still exited 0 in one path and left
+    /// `rebase-merge/` in the worktree's git dir, after which any further `wt`
+    /// command fails with "a git operation is already in progress".
+    pub fn left_operation_in_progress(&self, worktree_path: &Path) -> bool {
+        let Ok(git_dir) = git_dir(worktree_path) else {
+            return false;
+        };
+        git_dir.join("rebase-merge").exists()
+            || git_dir.join("rebase-apply").exists()
+            || git_dir.join("MERGE_HEAD").exists()
+            || git_dir.join("CHERRY_PICK_HEAD").exists()
+    }
+}
+
+fn git_dir(path: &Path) -> Result<PathBuf, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if !out.status.success() {
+        return Err("not a git repository".into());
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let dir = if Path::new(&raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        path.join(raw)
+    };
+    Ok(dir)
+}
+
+/// Preview what `wt step prune` would remove.
+///
+/// `--dry-run` is what makes prune reviewable: the same criteria run, but
+/// nothing is removed.
+pub async fn prune_preview(
+    repo: &Path,
+    min_age: Option<&str>,
+) -> Result<Vec<PruneCandidate>, String> {
+    let mut cmd = wt_command(repo);
+    cmd.args(["step", "prune", "--dry-run", "--format=json", "-y"]);
+    if let Some(age) = min_age {
+        cmd.args(["--min-age", age]);
+    }
+
+    let (stdout, _) = run(cmd).await?;
+    extract_json(&stdout)
+}
+
+/// Remove everything worktrunk considers integrated.
+///
+/// `min_age` matters more than it looks: the default is `1d`, which silently
+/// skips a worktree created minutes ago — including a fresh branch off the
+/// default branch, which looks merged because it points at the same commit.
+/// Callers pass the age through explicitly so the UI can show it.
+pub async fn prune(repo: &Path, min_age: Option<&str>) -> Result<String, String> {
+    let mut cmd = wt_command(repo);
+    cmd.args(["step", "prune", "--foreground", "--format=json", "-y"]);
+    if let Some(age) = min_age {
+        cmd.args(["--min-age", age]);
+    }
+    let (stdout, stderr) = run(cmd).await?;
+    Ok(format!("{stdout}{stderr}"))
 }
 
 /// Remove a worktree and, when safe, its branch.

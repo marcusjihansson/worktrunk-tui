@@ -18,18 +18,23 @@ wt tui          # because the binary is named wt-tui, worktrunk exposes it here
 
 - **Live updates without a server.** Creating or removing a worktree adds or
   removes a directory under the repository's shared `.git/worktrees/`, so a
-  filesystem watch is enough to notice an agent's work appear. Your cursor stays
-  on the same branch when the list changes underneath you.
+  filesystem watch is enough to notice an agent's work appear — measured at
+  ~260ms. Your cursor stays on the same branch when the list changes underneath
+  you.
+- **Search across every worktree at once.** One query, all worktrees, results
+  grouped by file with the matching file's content alongside. A string present
+  in five worktrees is found once and reported as reaching five.
 - **A table driven by worktrunk's own facts.** Status symbols, default-branch
   relations, integration verdicts, and safe-to-delete dimming all come from
   `wt list`'s output rather than being recomputed, so the two tools never
   disagree about what is safe.
 - **Filtering** across branch, path, marker, commit subject, and PR number.
 - **A preview pane** showing the selected worktree's diff (default) or log.
-- **Create** a worktree for a new branch.
-- **Remove**, behind a dialog that explains *why* a branch is or is not safe to
-  delete — uncommitted work, integration status, merge conflicts, in-progress
-  git operations — and reports worktrunk's own outcome vocabulary afterwards.
+- **Create**, **merge**, and **remove** — each behind a dialog that explains what
+  is about to happen, using worktrunk's own reasoning to explain *why*.
+- **Prune** in bulk, from a `--dry-run` preview you read before anything is
+  removed.
+- **PR and CI status** on demand, without putting the forge on the refresh path.
 
 ## Keys
 
@@ -38,17 +43,81 @@ wt tui          # because the binary is named wt-tui, worktrunk exposes it here
 | `↑` `↓` `j` `k` | Move selection |
 | `g` / `G` | First / last row |
 | `Tab` | Switch focus between table and preview |
-| `↑` `↓` (preview) | Scroll the preview pane |
 | `t` | Cycle preview tab (diff / log) |
 | `/` | Filter (live; `Enter` commits, `Esc` clears) |
 | `n` | Create a worktree for a new branch |
 | `d` | Remove the selected worktree |
+| `m` | Merge the selected branch into the default branch |
+| `P` | Prune branches that are already integrated |
+| `s` | Toggle the cross-worktree search view |
+| `S` | Fetch PR and CI status (needs a remote forge and `gh`/`glab`) |
 | `y` / `c` | Copy branch name / worktree path |
 | `e` | Open the worktree in `$EDITOR` |
 | `o` | Open the pull request in a browser |
 | `r` | Refresh now |
 | `?` | Keybinding help |
 | `q` | Quit |
+
+### Search
+
+| Key | Action |
+| --- | --- |
+| `s` | Toggle search / back to the table |
+| `/` | Start a new query (`Enter` runs it) |
+| `j` / `k` | Move between results |
+| `i` / `I` | Case-insensitive on / off |
+| `r` / `R` | Regex mode on / off |
+| `f` | Search only the rows passing the table's filter |
+| `Enter` | Re-run the current query |
+
+Search is **literal by default**; regex is opt-in. A search box that silently
+treats `.` as a wildcard makes `config.rs` also match `configXrs` and buries
+the hit you wanted.
+
+## Search and deduplication
+
+Worktrees branched from the same commit have byte-identical trees, and each is a
+separate copy on disk. Walking every one searches the same bytes N times for no
+extra information, so `git rev-parse HEAD^{tree}` is used as a dedup key: one
+walk per distinct tree, then each hit is attributed to every worktree sharing
+that tree.
+
+Measured on 6 worktrees over 30MB / 1,200 files per worktree (5 sharing one
+tree):
+
+| | deduplicated | naive |
+| --- | --- | --- |
+| trees walked | 2 | 6 |
+| time | 76ms | 296ms |
+
+That is the difference between a feature that feels instant and one that feels
+broken as worktree count grows. `cargo run --release --example search_bench -- <repo> <query>`
+reproduces the measurement.
+
+Search covers tracked, gitignore-respecting, non-binary files.
+
+## Things worth knowing
+
+**`wt merge` merges the *current* branch into the target.** Running
+`wt merge <branch>` from the repository root merges the root's branch *into*
+`<branch>` — the opposite of what pressing "merge" on a row means. wt-tui
+therefore invokes it as `wt -C <the row's worktree> merge <target>`, and
+`tests/lifecycle.rs` asserts both directions.
+
+**A conflicted merge can report success.** Worktrunk may exit cleanly with no
+JSON while leaving a rebase in progress, after which every later `wt` command
+fails with "a git operation is already in progress". wt-tui does not trust the
+payload: it checks the worktree's git directory and says so plainly.
+
+**`wt step prune` skips worktrees younger than `--min-age` (default 1 day).**
+A branch created minutes ago points at the same commit as the default branch and
+so looks merged. The prune dialog shows the guard and lets you cycle it
+(`0` / `1d` / `7d`) so "nothing happened" is never a mystery.
+
+**`--full` reaches the forge over the network** (~1.3s against a real GitHub
+repo with 12 worktrees, versus ~0.55s plain), so PR/CI data is fetched only when
+you press `S`. The CI column distinguishes *not requested*, *no forge*, and
+*collected with nothing to report*, rather than implying a branch has no checks.
 
 ## How it talks to worktrunk
 
@@ -78,7 +147,10 @@ Three defences keep that honest:
 
 `tests/live.rs` additionally exercises the real binary: create/remove round
 trips, a worktree created by another process, and worktrunk's refusal to drop
-uncommitted changes without `--force`.
+uncommitted changes without `--force`. `tests/lifecycle.rs` covers merge
+direction and the conflicted-merge case; `tests/search.rs` covers search against
+real worktrees, including that deduplication neither loses a result nor
+misattributes one.
 
 ## Discovering it as `wt tui`
 
@@ -105,13 +177,13 @@ integration *is* the contract.
 
 ## Status
 
-Phase 1. Not yet implemented, and each is additive — none needs a contract
+Phases 1 and 2. Not yet implemented, and each is additive — none needs a contract
 change:
 
-- Cross-worktree content search (ripgrep's `ignore` + `grep-searcher`, in-process)
-- `wt merge` in the lifecycle, plus `wt step prune` and `wt step relocate`
-- A PR/CI view via `wt list --full`, and dev-server URLs
-- Bulk operations across a selection
+- `wt step relocate` for worktrees whose path has drifted
+- Dev-server URLs (`dev_server.url` / `listening`) per worktree
+- Bulk operations across a selection, rather than one row at a time
+- Jump-to-file from a search result, opening the worktree in `$EDITOR`
 
 ## Licence
 

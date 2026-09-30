@@ -15,12 +15,37 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             "remove {branch}{}?  (y/n, f force)",
             if *force { " [FORCED]" } else { "" }
         )),
+        Mode::Searching(buffer) => Some(format!("search: {buffer}▏")),
+        Mode::ConfirmMerge {
+            branch,
+            target,
+            keep_worktree,
+        } => Some(format!(
+            "merge {branch} → {target}{}?  (y/n, w keep worktree)",
+            if *keep_worktree {
+                " [keep worktree]"
+            } else {
+                ""
+            }
+        )),
+        Mode::ConfirmPrune {
+            candidates,
+            min_age,
+        } => Some(format!(
+            "prune {} candidate(s) at min-age {min_age}?  (y/n, a cycle)",
+            candidates.len()
+        )),
         Mode::Busy => Some("running…".to_string()),
         Mode::Normal => None,
     };
 
     let style = match app.mode {
-        Mode::ConfirmRemove { .. } => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Mode::ConfirmRemove { .. } | Mode::ConfirmPrune { .. } => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
+        Mode::ConfirmMerge { .. } => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
         Mode::Busy => Style::default().fg(Color::Yellow),
         _ => Style::default().fg(Color::Cyan),
     };
@@ -44,6 +69,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn default_line(app: &App) -> Line<'static> {
+    // The search view's status line reports the search itself; a results
+    // summary is more useful there than a list of keybindings.
+    if app.view == crate::app::View::Search {
+        return search_line(app);
+    }
+
     let hint = Style::default().fg(Color::DarkGray);
     let accent = Style::default().fg(Color::Cyan);
 
@@ -59,9 +90,46 @@ fn default_line(app: &App) -> Line<'static> {
         spans.push(Span::styled("preview focused · ", hint));
     }
     spans.push(Span::styled(
-        "?:keys  /:filter  n:new  d:remove  Tab:focus  q:quit",
+        "?:keys  /:filter  n:new  d:remove  m:merge  P:prune  s:search  q:quit",
         hint,
     ));
+    Line::from(spans)
+}
+
+/// The search status line: the query, its modifiers, and the result summary.
+fn search_line(app: &App) -> Line<'static> {
+    let hint = Style::default().fg(Color::DarkGray);
+    let accent = Style::default().fg(Color::Cyan);
+    let search = &app.search;
+
+    let mut spans = vec![Span::styled(format!("/{} ", search.query), accent)];
+
+    // The active modifiers, so it is obvious why a search matched nothing.
+    if search.options.case_insensitive {
+        spans.push(Span::styled("i ", Style::default().fg(Color::Yellow)));
+    }
+    if search.options.force_regex {
+        spans.push(Span::styled("re ", Style::default().fg(Color::Yellow)));
+    }
+    if search.only_filtered {
+        spans.push(Span::styled(
+            "filtered ",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    spans.push(Span::styled("· ", hint));
+
+    if search.running {
+        spans.push(Span::styled("searching…", accent));
+    } else if search.query.is_empty() {
+        spans.push(Span::styled("type a query, then Enter to search", hint));
+    } else {
+        spans.push(Span::styled(
+            crate::ui::search_view::summary(&search.results, search.elapsed),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
     Line::from(spans)
 }
 

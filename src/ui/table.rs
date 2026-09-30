@@ -238,8 +238,17 @@ fn ci_text(item: &Item, app: &App) -> (String, Color) {
     if item.pr.is_some() {
         return ("· PR".to_string(), Color::DarkGray);
     }
-    if app.collected_ci {
+    // PR/CI facts only arrive with `--full`, and `collected.ci` reports whether
+    // the run actually gathered them. Three states must stay distinct, or the
+    // column lies: not requested, requested but not collected (no remote
+    // forge), and collected with nothing to report.
+    if app.fetching && app.ci_attempted {
+        ("fetching".to_string(), Color::DarkGray)
+    } else if app.collected_ci {
         ("—".to_string(), Color::DarkGray)
+    } else if app.ci_attempted {
+        // Requested, but worktrunk had no forge to ask (no remote, or no `gh`).
+        ("no forge".to_string(), Color::DarkGray)
     } else {
         ("".to_string(), Color::DarkGray)
     }

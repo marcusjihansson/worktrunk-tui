@@ -28,14 +28,89 @@ pub enum Mode {
     Filtering(String),
     /// Typing a new branch name, bound to `n`.
     Creating(String),
+    /// Typing a search query, bound to `/` in search mode.
+    Searching(String),
     /// Confirming a removal, bound to `d`.
     ConfirmRemove {
         branch: String,
         force: bool,
         dirty: bool,
     },
+    /// Confirming a merge, bound to `m`.
+    ConfirmMerge {
+        branch: String,
+        target: String,
+        keep_worktree: bool,
+    },
+    /// Confirming a bulk prune, bound to `P`.
+    ConfirmPrune {
+        candidates: Vec<command::PruneCandidate>,
+        min_age: String,
+    },
     /// A `wt` command is running; only quit is honoured.
     Busy,
+}
+
+/// What the main area is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// The worktree table.
+    Worktrees,
+    /// Cross-worktree search results.
+    Search,
+}
+
+/// The search session: the query, its results, and the file being previewed.
+#[derive(Debug, Default)]
+pub struct SearchState {
+    pub query: String,
+    pub results: crate::search::Results,
+    /// The file around the selected hit.
+    pub context_body: String,
+    /// Index into `results.hits`.
+    pub selected: usize,
+    pub scroll: u16,
+    pub running: bool,
+    pub elapsed: Option<std::time::Duration>,
+    pub options: crate::search::QueryOptions,
+    /// Whether to search every worktree or only the filtered rows.
+    pub only_filtered: bool,
+}
+
+impl SearchState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn selected_hit(&self) -> Option<&crate::search::Hit> {
+        self.results.hits.get(self.selected)
+    }
+
+    /// Move the cursor, clamped to the result list.
+    pub fn move_by(&mut self, delta: isize) {
+        if self.results.hits.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let len = self.results.hits.len() as isize;
+        self.selected = (self.selected as isize + delta).clamp(0, len - 1) as usize;
+        self.scroll = 0;
+        self.context_body.clear();
+    }
+
+    /// Set the query and clear stale results.
+    ///
+    /// Results are cleared rather than left on screen because they belong to the
+    /// previous query; showing them under new text would be a lie.
+    pub fn set_query(&mut self, query: String) {
+        if self.query != query {
+            self.query = query;
+            self.results = crate::search::Results::default();
+            self.context_body.clear();
+            self.selected = 0;
+            self.scroll = 0;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +135,37 @@ pub struct Pending {
     pub refresh: bool,
     /// True when the preview tab changed and its body must be re-fetched.
     pub preview_stale: bool,
+    /// A search to run: the query and the targets to search.
+    pub search: Option<SearchRequest>,
+    /// A merge to run: the source worktree, the target branch, and whether to
+    /// keep the worktree.
+    pub merge: Option<MergeRequest>,
+    /// Load the prune candidate list without removing anything.
+    pub prune_preview: bool,
+    /// A min-age override chosen in the prune dialog, applied to the preview
+    /// that follows so the list matches what would actually happen.
+    pub prune_age: Option<String>,
+    /// Prune with the given min-age.
+    pub prune: Option<String>,
+    /// Fetch PR/CI data with `wt list --full`.
+    pub fetch_ci: bool,
+}
+
+/// A search to run off the UI thread.
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    pub query: String,
+    pub options: crate::search::QueryOptions,
+}
+
+/// A merge to run off the UI thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeRequest {
+    /// The worktree whose branch is the merge source.
+    pub worktree: PathBuf,
+    pub branch: String,
+    pub target: String,
+    pub keep_worktree: bool,
 }
 
 impl Pending {
@@ -72,6 +178,10 @@ impl Pending {
 pub struct App {
     /// The repository under watch.
     repo: PathBuf,
+    /// What the main area shows.
+    pub view: View,
+    /// The search session, populated when `view` is `Search`.
+    pub search: SearchState,
     /// Rows as last loaded from `wt list`.
     pub rows: Vec<Item>,
     /// Indices into `rows` that survive the current filter.
@@ -104,12 +214,17 @@ pub struct App {
     pub branches: Vec<String>,
     /// True when a `--full` load has happened, so PR/CI columns are meaningful.
     pub collected_ci: bool,
+    /// True once a `--full` load has been requested. Before that, the CI column
+    /// says "not fetched" instead of implying a branch has no checks.
+    pub ci_attempted: bool,
 }
 
 impl App {
     pub fn new(repo: PathBuf) -> Self {
         Self {
             repo,
+            view: View::Worktrees,
+            search: SearchState::new(),
             rows: Vec::new(),
             visible: Vec::new(),
             loaded: false,
@@ -129,6 +244,7 @@ impl App {
             preview: ui::preview::Preview::new(),
             branches: Vec::new(),
             collected_ci: false,
+            ci_attempted: false,
         }
     }
 
@@ -153,6 +269,10 @@ impl App {
     /// The row index the table should highlight.
     pub fn selected_row(&self) -> usize {
         self.selected
+    }
+
+    pub fn selected_hit(&self) -> Option<&crate::search::Hit> {
+        self.search.selected_hit()
     }
 
     pub fn selected_path(&self) -> Option<PathBuf> {
@@ -286,6 +406,7 @@ impl App {
             Mode::Busy => return true,
             Mode::Filtering(buffer) => return self.on_key_filtering(key, &buffer),
             Mode::Creating(buffer) => return self.on_key_creating(key, &buffer),
+            Mode::Searching(buffer) => return self.on_key_searching(key, &buffer),
             Mode::ConfirmRemove {
                 branch,
                 force,
@@ -293,7 +414,32 @@ impl App {
             } => {
                 return self.on_key_confirm(key, branch, force, dirty);
             }
+            Mode::ConfirmMerge {
+                branch,
+                target,
+                keep_worktree,
+            } => {
+                return self.on_key_merge(key, branch, target, keep_worktree);
+            }
+            Mode::ConfirmPrune {
+                candidates,
+                min_age,
+            } => {
+                return self.on_key_prune(key, candidates, min_age);
+            }
             Mode::Normal => {}
+        }
+
+        // While the search query is being typed, it owns every key. Without this the
+        // table's bindings would fire mid-query: typing "r" would refresh and
+        // "i" would toggle case-insensitivity instead of producing a character.
+        if matches!(self.mode, Mode::Searching(_)) {
+            return true;
+        }
+
+        // In search mode the same navigation keys drive the results list.
+        if self.view == View::Search && self.on_key_in_search(key) {
+            return true;
         }
 
         if self.show_help {
@@ -353,9 +499,44 @@ impl App {
                 self.preview.scroll = 0;
                 self.pending.preview_stale = true;
             }
-            KeyCode::Char('/') => self.mode = Mode::Filtering(self.filter.clone()),
+            // `/` refines the table's filter, keeping its text so it can be
+            // narrowed. In the search view it starts a new query instead:
+            // pre-filling the previous one would leave you appending to a
+            // finished search, which is not what pressing `/` means there.
+            KeyCode::Char('/') => {
+                self.mode = if self.view == View::Search {
+                    self.search.query.clear();
+                    Mode::Searching(String::new())
+                } else {
+                    Mode::Filtering(self.filter.clone())
+                };
+            }
             KeyCode::Char('n') => self.mode = Mode::Creating(String::new()),
             KeyCode::Char('d') => self.begin_remove(),
+            KeyCode::Char('m') => self.begin_merge(),
+            // `s` toggles the view. Entering it focuses the query when there is no query
+            // yet, and otherwise leaves the cursor on the results so the
+            // navigation and modifier keys work immediately.
+            KeyCode::Char('s') => {
+                if self.view == View::Search {
+                    self.view = View::Worktrees;
+                } else {
+                    self.view = View::Search;
+                    if self.search.query.is_empty() {
+                        self.mode = Mode::Searching(String::new());
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                // Only fetch PR/CI data; never on the watcher's hot path,
+                // because `--full` reaches the forge over the network.
+                self.pending.fetch_ci = true;
+                self.set_notice("fetching PR and CI status…", NoticeKind::Info);
+            }
+            KeyCode::Char('P') => {
+                self.pending.prune_preview = true;
+                self.mode = Mode::Busy;
+            }
             KeyCode::Char('y') => {
                 if let Some(item) = self.selected_item() {
                     let text = item.branch.clone().unwrap_or_else(|| item.label());
@@ -374,6 +555,205 @@ impl App {
                 self.pending.refresh = true;
             }
             _ => {}
+        }
+        true
+    }
+
+    /// Keys that act only while the search view is showing.
+    ///
+    /// Returns true when the key was consumed, so the table's bindings do not
+    /// also fire.
+    fn on_key_in_search(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.search.move_by(1),
+            KeyCode::Char('k') | KeyCode::Up => self.search.move_by(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.search.move_by(-(i32::MAX as isize)),
+            KeyCode::Char('G') | KeyCode::End => self.search.move_by(i32::MAX as isize),
+            KeyCode::PageDown => self.search.move_by(10),
+            KeyCode::PageUp => self.search.move_by(-10),
+            // Modifiers that change how the *next* search behaves.
+            KeyCode::Char('i') => self.search.options.case_insensitive = true,
+            KeyCode::Char('I') => self.search.options.case_insensitive = false,
+            KeyCode::Char('r') => self.search.options.force_regex = true,
+            KeyCode::Char('R') => self.search.options.force_regex = false,
+            KeyCode::Char('f') => self.search.only_filtered = !self.search.only_filtered,
+            // Re-run the current query.
+            KeyCode::Enter => self.queue_search(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Ask the event loop to run a search over the current targets.
+    fn queue_search(&mut self) {
+        let query = self.search.query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.search.running = true;
+        self.pending.search = Some(SearchRequest {
+            query,
+            options: self.search.options,
+        });
+    }
+
+    /// The worktrees to search, honouring the scope toggle.
+    pub fn search_targets(&self) -> Vec<crate::search::Target> {
+        self.rows
+            .iter()
+            .filter(|item| !self.search.only_filtered || self.filter_matches(item))
+            .filter_map(|item| {
+                let path = item.worktree.as_ref()?.path.as_ref()?;
+                Some(crate::search::Target {
+                    branch: item.label(),
+                    path: PathBuf::from(path),
+                })
+            })
+            .collect()
+    }
+
+    /// Whether an item passes the table's filter, for search scoping.
+    fn filter_matches(&self, item: &Item) -> bool {
+        let needle = self.filter.to_lowercase();
+        if needle.is_empty() {
+            return true;
+        }
+        [
+            item.branch.clone(),
+            item.worktree.as_ref().and_then(|w| w.path.clone()),
+            item.marker.clone(),
+        ]
+        .iter()
+        .flatten()
+        .any(|f| f.to_lowercase().contains(&needle))
+    }
+
+    /// Open the merge dialog for the selected row.
+    fn begin_merge(&mut self) {
+        // Read what the dialog needs before touching `self.mode`, which would
+        // otherwise conflict with the borrow of the selected item.
+        let Some(item) = self.selected_item() else {
+            return;
+        };
+
+        // A merge needs a worktree: `wt merge` merges the *current* branch, and
+        // a branch-only row has none.
+        if item.worktree.is_none() {
+            self.set_notice(
+                "this branch has no worktree, so there is nothing to merge from",
+                NoticeKind::Error,
+            );
+            return;
+        }
+        let Some(branch) = item.branch.clone() else {
+            self.set_notice(
+                "a detached worktree has no branch to merge",
+                NoticeKind::Error,
+            );
+            return;
+        };
+
+        let target = self.default_branch().unwrap_or("main").to_string();
+        self.mode = Mode::ConfirmMerge {
+            branch,
+            target,
+            keep_worktree: false,
+        };
+    }
+
+    fn on_key_merge(
+        &mut self,
+        key: KeyEvent,
+        branch: String,
+        target: String,
+        keep_worktree: bool,
+    ) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') => self.mode = Mode::Normal,
+            KeyCode::Char('w') => {
+                self.mode = Mode::ConfirmMerge {
+                    branch,
+                    target,
+                    keep_worktree: !keep_worktree,
+                };
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if let Some(worktree) = self.selected_path() {
+                    self.pending.merge = Some(MergeRequest {
+                        worktree,
+                        branch,
+                        target,
+                        keep_worktree,
+                    });
+                    self.mode = Mode::Busy;
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn on_key_prune(
+        &mut self,
+        key: KeyEvent,
+        candidates: Vec<command::PruneCandidate>,
+        min_age: String,
+    ) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') => self.mode = Mode::Normal,
+            // Cycling the age guard matters: with the default of 1d, prune
+            // silently skips a worktree created minutes ago.
+            KeyCode::Char('a') => {
+                let next = match min_age.as_str() {
+                    "0" => "1d",
+                    "1d" => "7d",
+                    _ => "0",
+                };
+                self.pending.prune_preview = true;
+                self.mode = Mode::ConfirmPrune {
+                    candidates,
+                    min_age: next.to_string(),
+                };
+                self.pending.prune_age = Some(next.to_string());
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.pending.prune = Some(min_age);
+                self.mode = Mode::Busy;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Handle a keystroke while typing a search query.
+    fn on_key_searching(&mut self, key: KeyEvent, current: &str) -> bool {
+        let mut buffer = current.to_string();
+        let mut done = false;
+
+        match key.code {
+            KeyCode::Esc => {
+                // Escape abandons editing rather than clearing it: the text is
+                // often worth coming back to.
+                self.mode = Mode::Normal;
+                return true;
+            }
+            KeyCode::Enter => done = true,
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Char(c) => buffer.push(c),
+            _ => return true,
+        }
+
+        self.search.set_query(buffer.clone());
+
+        // Write the buffer back into the mode: the next keystroke reads it from
+        // there, so not updating it would leave only the last character typed.
+        if done {
+            self.mode = Mode::Normal;
+            self.queue_search();
+        } else if let Mode::Searching(text) = &mut self.mode {
+            *text = buffer;
         }
         true
     }

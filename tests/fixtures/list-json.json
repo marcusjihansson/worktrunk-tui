@@ -1,0 +1,173 @@
+{
+  "schema": 2,
+  "repo": {
+    "default_branch": "main"
+  },
+  "collected": {
+    "ci": false,
+    "summary": false
+  },
+  "items": [
+    {
+      "branch": "main",
+      "head": {
+        "sha": "13de7b67a998fc87ef17284aa21dc2b758a6eb96",
+        "short_sha": "13de7b6",
+        "subject": "initial commit",
+        "committed_at": "2026-09-30T09:17:18Z"
+      },
+      "worktree": {
+        "path": "/repo",
+        "main": true,
+        "current": true,
+        "previous": true,
+        "detached": false,
+        "branch_mismatch": false,
+        "duplicate_branch": false,
+        "changes": {
+          "staged": false,
+          "modified": false,
+          "untracked": false,
+          "renamed": false,
+          "deleted": false,
+          "conflicted": false,
+          "diff": {
+            "added": 0,
+            "deleted": 0
+          }
+        }
+      },
+      "upstream": {
+        "remote": "origin",
+        "branch": "main",
+        "ahead": 0,
+        "behind": 0
+      },
+      "display": {
+        "state": "is_main",
+        "symbols": "^|",
+        "statusline": "main  \u001b[2m^\u001b[22m\u001b[2m|\u001b[22m"
+      }
+    },
+    {
+      "branch": "feature-alpha",
+      "head": {
+        "sha": "d384d47664e448e869bd28fc92daff6a3a4e2d7f",
+        "short_sha": "d384d47",
+        "subject": "add feature work",
+        "committed_at": "2026-09-30T09:17:45Z"
+      },
+      "worktree": {
+        "path": "/repo.feature-alpha",
+        "main": false,
+        "current": false,
+        "previous": false,
+        "detached": false,
+        "branch_mismatch": false,
+        "duplicate_branch": false,
+        "changes": {
+          "staged": false,
+          "modified": false,
+          "untracked": false,
+          "renamed": false,
+          "deleted": false,
+          "conflicted": false,
+          "diff": {
+            "added": 0,
+            "deleted": 0
+          }
+        }
+      },
+      "default_branch": {
+        "ahead": 1,
+        "behind": 0,
+        "diff": {
+          "added": 1,
+          "deleted": 0
+        },
+        "orphan": false,
+        "merge_conflicts": false
+      },
+      "display": {
+        "state": "ahead",
+        "symbols": "\u2191",
+        "statusline": "feature-alpha  \u001b[2m\u2191\u001b[22m  \u001b[32m\u21911\u001b[0m  ^\u001b[32m+1\u001b[0m"
+      }
+    },
+    {
+      "branch": "feature-beta",
+      "head": {
+        "sha": "13de7b67a998fc87ef17284aa21dc2b758a6eb96",
+        "short_sha": "13de7b6",
+        "subject": "initial commit",
+        "committed_at": "2026-09-30T09:17:18Z"
+      },
+      "worktree": {
+        "path": "/repo.feature-beta",
+        "main": false,
+        "current": false,
+        "previous": false,
+        "detached": false,
+        "branch_mismatch": false,
+        "duplicate_branch": false,
+        "changes": {
+          "staged": true,
+          "modified": true,
+          "untracked": true,
+          "renamed": false,
+          "deleted": false,
+          "conflicted": false,
+          "diff": {
+            "added": 3,
+            "deleted": 1
+          }
+        }
+      },
+      "default_branch": {
+        "ahead": 0,
+        "behind": 0,
+        "diff": {
+          "added": 0,
+          "deleted": 0
+        },
+        "orphan": false,
+        "integration": {
+          "reason": "same_commit"
+        },
+        "merge_conflicts": false
+      },
+      "display": {
+        "state": "same_commit",
+        "symbols": "+!?\u2013",
+        "statusline": "feature-beta  \u001b[36m+\u001b[39m\u001b[36m!\u001b[39m\u001b[36m?\u001b[39m\u001b[2m\u2013\u001b[22m  @\u001b[32m+3\u001b[0m \u001b[31m-1\u001b[0m"
+      }
+    },
+    {
+      "branch": "branch-only",
+      "head": {
+        "sha": "13de7b67a998fc87ef17284aa21dc2b758a6eb96",
+        "short_sha": "13de7b6",
+        "subject": "initial commit",
+        "committed_at": "2026-09-30T09:17:18Z"
+      },
+      "default_branch": {
+        "ahead": 0,
+        "behind": 0,
+        "diff": {
+          "added": 0,
+          "deleted": 0
+        },
+        "orphan": false,
+        "integration": {
+          "reason": "same_commit"
+        },
+        "merge_conflicts": false
+      },
+      "display": {
+        "state": "empty",
+        "symbols": "_/",
+        "statusline": "branch-only  \u001b[2m/\u001b[22m\u001b[2m_\u001b[22m"
+      }
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Check, lint, test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The contract test validates wt-tui's model against the JSON Schema
+      # worktrunk publishes, and the live tests exercise the real `wt` binary.
+      # Both are the point of the integration, so both run in CI.
+      - name: Install worktrunk
+        run: cargo install worktrunk --locked
+
+      - name: Confirm worktrunk is usable
+        run: wt --version
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+
+      # The binary must build clean for the current target.
+      - run: cargo build --release

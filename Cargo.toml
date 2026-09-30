@@ -1,0 +1,50 @@
+[package]
+name = "wt-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "An observational TUI dashboard for worktrunk worktrees"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "wt-tui"
+path = "src/main.rs"
+
+[lib]
+name = "wt_tui"
+path = "src/lib.rs"
+
+[[test]]
+name = "contract"
+path = "tests/contract.rs"
+
+[[test]]
+name = "app_tests"
+path = "tests/app_tests.rs"
+
+[[test]]
+name = "live"
+path = "tests/live.rs"
+
+[dependencies]
+ansi-to-tui = "8.0.1"
+arboard = "3.6.1"
+clap = { version = "4.6", features = ["derive"] }
+crossterm = "0.29"
+notify = "8.2"
+open = "5.3"
+ratatui = "0.30"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "process", "sync", "time"] }
+unicode-width = "0.2"
+
+[dev-dependencies]
+jsonschema = "0.58"
+ratatui = "0.30"
+tempfile = "3"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+strip = true
+lto = "thin"

@@ -101,9 +101,14 @@ impl Preview {
         }
     }
 
-    /// The command to run for the given worktree and tab.
-    pub fn command(tab: PreviewTab, path: &std::path::Path) -> Vec<String> {
-        let mut args = match tab {
+    /// The git subcommand and flags for the given tab.
+    ///
+    /// Deliberately does *not* include the worktree path. The caller supplies it
+    /// through [`crate::wt::command::git_command`], which also clears ambient
+    /// `GIT_*` variables — keeping `-C <path>` here would be a quiet way to skip
+    /// that, and `-C` alone does not override `GIT_DIR`.
+    pub fn command(tab: PreviewTab) -> Vec<String> {
+        match tab {
             PreviewTab::Diff => vec![
                 "diff".to_string(),
                 "--stat".to_string(),
@@ -120,9 +125,6 @@ impl Preview {
                 "-n".to_string(),
                 "50".to_string(),
             ],
-        };
-        args.insert(0, "-C".to_string());
-        args.insert(1, path.to_string_lossy().into_owned());
-        args
+        }
     }
 }

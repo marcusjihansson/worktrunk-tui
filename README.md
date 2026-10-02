@@ -119,6 +119,25 @@ repo with 12 worktrees, versus ~0.55s plain), so PR/CI data is fetched only when
 you press `S`. The CI column distinguishes *not requested*, *no forge*, and
 *collected with nothing to report*, rather than implying a branch has no checks.
 
+### Environment variables
+
+`$EDITOR` opens the selected worktree. It is split on whitespace, so
+`EDITOR="code --wait"` works. The split happens in wt-tui and never in a shell:
+the worktree is passed as its own argument, and no shell ever sees `$EDITOR`.
+
+`GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE` and
+`GIT_OBJECT_DIRECTORY` are **cleared** on every `git` and `wt` child process.
+`git -C <path>` sets the working directory but does not override `GIT_DIR`, so an
+inherited one would silently retarget the whole tool at a different repository —
+`direnv`'s `layout_git` is the realistic source, and `.envrc` is repository
+content. With the override in place, `-C <repo>` is the only thing that decides
+which repository wt-tui acts on.
+
+`WT_TUI_WT_BIN` overrides the `wt` binary. It exists for the test suite and for
+setups where `wt` is not on `PATH`; there is no reason to set it by hand. Like
+`$EDITOR` it is used as a single path, so a value containing spaces will not
+resolve.
+
 ## How it talks to worktrunk
 
 Through `wt ... --format=json`, deliberately, and not by depending on the

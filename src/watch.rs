@@ -36,9 +36,7 @@ fn is_relevant(event: &Event) -> bool {
 fn worktrees_dir(repo: &Path) -> Result<PathBuf, String> {
     // `git rev-parse --git-common-dir` resolves correctly from inside a linked
     // worktree, where `.git` is a file rather than a directory.
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let out = crate::wt::command::git_command(repo)
         .args(["rev-parse", "--git-common-dir"])
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;

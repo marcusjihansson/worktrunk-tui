@@ -1,1 +1,14 @@
 /target
+target/
+
+# Secrets and local configuration. wt-tui is a developer tool run inside real
+# repositories, so a stray `.env` staged by accident is a real risk.
+.env
+.env.*
+*.local
+*.pem
+
+# Editor and OS noise.
+*.swp
+*.swo
+.DS_Store

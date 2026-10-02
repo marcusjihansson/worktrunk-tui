@@ -335,6 +335,71 @@ fn search_navigation_moves_the_result_cursor_not_the_table() {
     assert_eq!(app.search.selected, 2);
 }
 
+/// Moving between hits in one file must not invalidate the loaded body: the pane
+/// holds a whole file, so it stays correct, and clearing it per keystroke is what
+/// made every `j` re-read from disk. `move_by` no longer touches the body at
+/// all — the event loop decides, once it can resolve the hit's worktree.
+#[test]
+fn moving_between_hits_in_one_file_keeps_the_loaded_context() {
+    let mut app = app_with(vec![worktree_item("main", "/repo", true)]);
+    app.view = View::Search;
+    app.search.results = wt_tui::search::Results {
+        hits: vec![hit("main", "a.rs", 1), hit("main", "a.rs", 9)],
+        ..Default::default()
+    };
+
+    app.search.context_path = Some(("/repo".to_string(), "a.rs".to_string()));
+    app.search.context_body = "file body".to_string();
+
+    app.on_key(key(KeyCode::Char('j')));
+    assert_eq!(
+        app.search.context_body, "file body",
+        "the same file is still the right file to show"
+    );
+    assert_eq!(
+        app.search.context_path,
+        Some(("/repo".to_string(), "a.rs".to_string())),
+        "the body is still keyed to the file it was read from"
+    );
+}
+
+/// Two worktrees can each hold a `src/main.rs` that a query matches, and search
+/// deduplicates by tree rather than by path — so the same `rel_path` can belong
+/// to two different files. The key includes the worktree so one worktree's file
+/// is never shown under another's hit.
+#[test]
+fn the_same_relative_path_in_two_worktrees_is_a_different_file() {
+    let mut app = app_with(vec![
+        worktree_item("a", "/repo.a", false),
+        worktree_item("b", "/repo.b", false),
+    ]);
+    app.view = View::Search;
+    app.search.results = wt_tui::search::Results {
+        hits: vec![hit("a", "src/main.rs", 1), hit("b", "src/main.rs", 1)],
+        ..Default::default()
+    };
+
+    let from_a = ("/repo.a".to_string(), "src/main.rs".to_string());
+    let from_b = ("/repo.b".to_string(), "src/main.rs".to_string());
+    assert_ne!(
+        from_a, from_b,
+        "two worktrees' identically named files must not share a key"
+    );
+
+    app.search.context_path = Some(from_a);
+    app.search.context_body = "a's file".to_string();
+
+    // Moving to the hit in the other worktree leaves the stale key in place;
+    // the event loop compares the full key and reloads. What matters here is
+    // that the two are distinguishable at all.
+    app.on_key(key(KeyCode::Char('j')));
+    assert_ne!(
+        app.search.context_path.as_ref(),
+        Some(&from_b),
+        "the body must still be keyed to worktree a, not silently reused for b"
+    );
+}
+
 #[test]
 fn search_targets_exclude_branch_only_rows() {
     let mut branch_only = worktree_item("no-worktree", "", false);
@@ -432,10 +497,16 @@ fn merge_opens_a_dialog_naming_the_branch_and_default_target() {
         Mode::ConfirmMerge {
             branch,
             target,
+            worktree,
             keep_worktree,
         } => {
             assert_eq!(branch, "feature");
             assert_eq!(target, "main", "the default branch is the merge target");
+            assert_eq!(
+                worktree,
+                &PathBuf::from("/repo.feature"),
+                "the dialog must name the worktree it will act on"
+            );
             assert!(!keep_worktree);
         }
         other => panic!("expected a merge dialog, got {other:?}"),
@@ -484,6 +555,52 @@ fn merge_can_keep_the_worktree() {
     app.on_key(key(KeyCode::Char('y')));
     let request = app.pending.merge.take().expect("merge queued");
     assert!(request.keep_worktree);
+}
+
+/// The regression test for the worst bug in this tool's history: a refresh
+/// landing between `m` and `y` moved the cursor, and the merge ran against
+/// whatever row the index fallback happened to point at — merging and then
+/// *deleting* a branch the user never confirmed.
+///
+/// The dialog must act on the row it named, whatever the selection does while
+/// it is open.
+#[test]
+fn merge_acts_on_the_confirmed_row_even_if_the_selection_moves() {
+    let mut app = app_with(vec![
+        worktree_item("main", "/repo", true),
+        worktree_item("feature", "/repo.feature", false),
+        worktree_item("other", "/repo.other", false),
+    ]);
+    app.on_key(key(KeyCode::Char('j')));
+    app.on_key(key(KeyCode::Char('m')));
+
+    // A refresh lands while the dialog is open: `feature` is gone and the
+    // index fallback slides the cursor onto `other`.
+    app.apply(
+        envelope(vec![
+            worktree_item("main", "/repo", true),
+            worktree_item("other", "/repo.other", false),
+        ]),
+        Some("main".to_string()),
+    );
+
+    app.on_key(key(KeyCode::Char('y')));
+
+    let request = app.pending.merge.take().expect("merge queued");
+    assert_eq!(
+        request.worktree,
+        PathBuf::from("/repo.feature"),
+        "the merge must target the row that was confirmed"
+    );
+    assert_eq!(
+        request.branch, "feature",
+        "the branch named in the dialog is the one that must be merged"
+    );
+    assert_ne!(
+        request.worktree,
+        PathBuf::from("/repo.other"),
+        "a row the user never confirmed must never be merged"
+    );
 }
 
 #[test]
@@ -577,21 +694,75 @@ fn the_prune_dialog_lists_candidates_and_the_age_guard() {
 #[test]
 fn the_age_guard_can_be_cycled_and_is_applied_to_the_preview() {
     let mut app = app_with(vec![worktree_item("main", "/repo", true)]);
-    let candidates = vec![];
     app.mode = Mode::ConfirmPrune {
-        candidates,
+        candidates: vec![],
         min_age: "1d".to_string(),
     };
 
+    // Cycling the age must not relabel the list already on screen: the
+    // candidates were chosen by a dry run at `1d`, and a different age selects a
+    // different set. So the mode is left for the fresh preview to populate.
     app.on_key(key(KeyCode::Char('a')));
     assert_eq!(app.pending.prune_age.as_deref(), Some("7d"));
-    match &app.mode {
-        Mode::ConfirmPrune { min_age, .. } => assert_eq!(min_age, "7d"),
-        other => panic!("expected a prune dialog, got {other:?}"),
-    }
+    assert!(
+        app.pending.prune_preview,
+        "a new dry run must be requested for the new age"
+    );
+    assert!(
+        matches!(app.mode, Mode::Busy),
+        "the dialog must not claim an age its list was not computed with"
+    );
+    assert_eq!(
+        app.pending.prune, None,
+        "nothing may be queued for prune while the preview is stale"
+    );
 
+    // While the preview is in flight, `y` cannot confirm: Busy swallows it.
+    app.on_key(key(KeyCode::Char('y')));
+    assert_eq!(app.pending.prune, None);
+
+    // The preview returns and the dialog is rebuilt at the requested age, from
+    // which the next cycle continues.
+    app.mode = Mode::ConfirmPrune {
+        candidates: vec![],
+        min_age: "7d".to_string(),
+    };
     app.on_key(key(KeyCode::Char('a')));
     assert_eq!(app.pending.prune_age.as_deref(), Some("0"));
+}
+
+#[test]
+fn a_prune_preview_can_be_cancelled_while_it_is_in_flight() {
+    let mut app = app_with(vec![worktree_item("main", "/repo", true)]);
+    app.pending.prune_preview = true;
+    app.mode = Mode::Busy;
+
+    // A `wt` call that hangs must not strand the user.
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.pending.prune, None);
+}
+
+#[test]
+fn prune_cannot_run_with_an_age_other_than_the_one_previewed() {
+    let mut app = app_with(vec![worktree_item("main", "/repo", true)]);
+
+    // A preview lands at `1d` and populates the dialog.
+    app.mode = Mode::ConfirmPrune {
+        candidates: vec![],
+        min_age: "1d".to_string(),
+    };
+
+    // Cycle to `0`. The list on screen is still the `1d` list.
+    app.on_key(key(KeyCode::Char('a')));
+    app.mode = Mode::ConfirmPrune {
+        candidates: vec![],
+        min_age: "0".to_string(),
+    };
+
+    // Confirming runs at the age that produced the list now on screen.
+    app.on_key(key(KeyCode::Char('y')));
+    assert_eq!(app.pending.prune.as_deref(), Some("0"));
 }
 
 #[test]

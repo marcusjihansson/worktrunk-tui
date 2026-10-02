@@ -16,6 +16,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &crate::app::App) {
     let Mode::ConfirmMerge {
         branch,
         target,
+        worktree,
         keep_worktree,
         ..
     } = &app.mode
@@ -41,8 +42,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &crate::app::App) {
     frame.render_widget(block, popup);
 
     let mut lines = Vec::new();
-    if let Some(item) = app.selected_item() {
-        lines.extend(facts(item, target, *keep_worktree));
+    // Facts come from the captured worktree, not the live selection: if the
+    // confirmed row is gone, show nothing rather than another branch's facts.
+    match app.item_for_worktree(worktree) {
+        Some(item) => lines.extend(facts(item, target, *keep_worktree)),
+        None => lines.push(Line::from(Span::styled(
+            "this worktree is no longer listed — its state is unknown",
+            Style::default().fg(Color::Yellow),
+        ))),
     }
 
     lines.push(Line::from(""));

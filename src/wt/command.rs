@@ -76,13 +76,57 @@ pub fn extract_json<T: serde::de::DeserializeOwned>(stdout: &str) -> Result<T, S
     ))
 }
 
+/// Environment variables that redirect where git finds its repository.
+///
+/// `git -C <path>` changes the *working directory*; it does **not** override
+/// these. A `GIT_DIR` in the environment wins outright, so every child process
+/// would silently act on a different repository than the one wt-tui was
+/// launched against. Verified against `wt` v0.80.0: with `GIT_DIR` pointing at
+/// another repo, `wt -C <repoA> list` reported repoB's worktrees, branches and
+/// paths, and `wt -C <repoA> remove <branch> -y` deleted repoB's branch.
+///
+/// `direnv`'s `layout_git` is the realistic source, and `.envrc` is repository
+/// content — so this is reachable by cloning a repository, not just by
+/// misconfiguring a shell.
+///
+/// wt-tui is a destructive tool (`remove`, `prune`, `merge`, `switch`), so it
+/// has to be hermetic about which repository it operates on. Clearing these
+/// makes `-C <repo>` the single source of truth, which is the entire design of
+/// [`wt_command`] and [`git_command`].
+pub const GIT_RESOLUTION_VARS: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+];
+
+/// A `git` invocation rooted at `path`, insulated from ambient git variables.
+///
+/// Same reasoning as [`wt_command`]: the `-C` argument is the only thing that
+/// should decide which repository is meant.
+pub fn git_command(path: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    for var in GIT_RESOLUTION_VARS {
+        cmd.env_remove(var);
+    }
+    cmd.arg("-C").arg(path);
+    cmd
+}
+
 /// Build a `wt` invocation rooted at `repo`.
 ///
 /// `-C` is always passed explicitly so the TUI behaves identically regardless
 /// of where it was launched from, and so a mutation targets the worktree the
 /// user is looking at rather than an ambient directory.
+///
+/// Ambient `GIT_*` variables are cleared because `-C` does not override them;
+/// see [`GIT_RESOLUTION_VARS`].
 fn wt_command(repo: &Path) -> Command {
     let mut cmd = Command::new(wt_binary());
+    for var in GIT_RESOLUTION_VARS {
+        cmd.env_remove(var);
+    }
     cmd.arg("-C").arg(repo);
     cmd.stdin(Stdio::null());
     cmd
@@ -285,9 +329,7 @@ impl MergeOutcome {
 }
 
 fn git_dir(path: &Path) -> Result<PathBuf, String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
+    let out = git_command(path)
         .args(["rev-parse", "--git-dir"])
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
@@ -357,11 +399,35 @@ pub async fn remove(
     extract_json(&stdout)
 }
 
-/// Open a path in the user's editor, used by the "open worktree" action.
-pub fn editor_command() -> Option<String> {
-    std::env::var("EDITOR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+/// The editor to open a worktree with, split into a program and its flags.
+///
+/// `$EDITOR` is routinely set to a command *with arguments* —
+/// `EDITOR="code --wait"`, `EDITOR="emacsclient -c"`, `EDITOR="nvim -p"` — so
+/// the value has to be word-split. `Command::new` treats its program as a single
+/// path and never consults a shell, so an unsplit value simply failed to launch
+/// with `No such file or directory`.
+///
+/// The split happens here, in Rust, and the worktree is appended as a separate
+/// argument. Deliberately *not* `sh -c "$EDITOR \"$path\""`: that would fix a
+/// cosmetic bug by introducing a shell, and would hand `$EDITOR` — which can
+/// come from a `.envrc` or a plugin host's environment — a quoting context to
+/// break out of.
+pub fn editor_command() -> Option<EditorCommand> {
+    let raw = std::env::var("EDITOR").ok()?;
+    let mut words = raw.split_whitespace().map(str::to_string);
+    let program = words.next()?;
+    Some(EditorCommand {
+        program,
+        args: words.collect(),
+    })
+}
+
+/// A program and its arguments, as resolved from `$EDITOR`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorCommand {
+    pub program: String,
+    /// Flags that precede the path.
+    pub args: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -439,5 +505,96 @@ mod tests {
     fn reports_helpfully_when_there_is_no_json() {
         let err = extract_json::<SwitchResult>("error: something went wrong").unwrap_err();
         assert!(err.contains("no JSON found"), "unexpected message: {err}");
+    }
+
+    /// `-C <path>` sets the working directory but does **not** override `GIT_DIR`,
+    /// so an inherited one silently retargets every child at a different repo.
+    /// Verified against `wt` v0.80.0: with `GIT_DIR` set elsewhere,
+    /// `wt -C <repoA> remove <branch> -y` destroyed repoB's branch.
+    ///
+    /// Asserted on the command's own environment rather than by running git, so
+    /// this needs no subprocess and no mutation of this process's environment
+    /// (which would race every other test in this binary).
+    #[test]
+    fn git_command_clears_git_resolution_vars() {
+        let cmd = git_command(Path::new("/repo"));
+        let set: Vec<&std::ffi::OsStr> = cmd
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|_| key))
+            .collect();
+
+        for var in GIT_RESOLUTION_VARS {
+            assert!(
+                !set.contains(&std::ffi::OsStr::new(var)),
+                "{var} would be inherited by a child process: {set:?}"
+            );
+        }
+    }
+
+    /// Pinned so a var cannot be dropped from the shared list — `wt_command`
+    /// clears the same list, and `tokio::process::Command` exposes no
+    /// `get_envs` to assert on directly.
+    #[test]
+    fn the_cleared_var_list_is_complete() {
+        for expected in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+        ] {
+            assert!(
+                GIT_RESOLUTION_VARS.contains(&expected),
+                "{expected} is no longer cleared; -C alone would not protect against it"
+            );
+        }
+    }
+
+    fn split_editor(raw: &str) -> Option<EditorCommand> {
+        let mut words = raw.split_whitespace().map(str::to_string);
+        let program = words.next()?;
+        Some(EditorCommand {
+            program,
+            args: words.collect(),
+        })
+    }
+
+    /// `$EDITOR` is routinely set to a command *with flags*. `Command::new`
+    /// treats the program as a single path and never consults a shell, so
+    /// `EDITOR="code --wait"` used to fail with `No such file or directory`.
+    #[test]
+    fn an_editor_with_flags_is_split_into_a_program_and_args() {
+        let editor = split_editor("code --wait").expect("split");
+        assert_eq!(editor.program, "code");
+        assert_eq!(editor.args, vec!["--wait".to_string()]);
+    }
+
+    #[test]
+    fn a_bare_editor_name_has_no_args() {
+        let editor = split_editor("nvim").expect("split");
+        assert_eq!(editor.program, "nvim");
+        assert!(editor.args.is_empty());
+    }
+
+    /// Empty and whitespace-only values are "not configured", not a program
+    /// named "".
+    #[test]
+    fn an_unset_or_blank_editor_is_reported_as_absent() {
+        assert!(split_editor("").is_none());
+        assert!(split_editor("   \t ").is_none());
+    }
+
+    /// Splitting is whitespace-only and never shell-aware: a quoted argument
+    /// stays one word with its quotes, because introducing a shell here would
+    /// hand `$EDITOR` a quoting context to escape.
+    #[test]
+    fn editor_arguments_are_not_shell_parsed() {
+        let editor = split_editor("emacsclient -c 'a b'").expect("split");
+        assert_eq!(editor.program, "emacsclient");
+        assert_eq!(
+            editor.args,
+            vec!["-c".to_string(), "'a".to_string(), "b'".to_string()],
+            "quoting is deliberately not interpreted"
+        );
     }
 }

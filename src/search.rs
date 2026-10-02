@@ -29,10 +29,16 @@ use grep_searcher::sinks::UTF8;
 use ignore::WalkState;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 /// Upper bound on collected hits. A query matching everything on a large corpus
 /// would otherwise exhaust memory; truncation is surfaced in the UI.
+///
+/// The cap is enforced *during* the walk by a counter shared between the worker
+/// threads, not after it. A per-file cap alone is not a bound: a broad query
+/// where every file matches a handful of lines would accumulate every hit in
+/// the corpus before any limit was consulted.
 pub const MAX_HITS: usize = 5_000;
 
 /// One matching line, attributed to every worktree holding that content.
@@ -158,9 +164,7 @@ fn regex_escape(input: &str) -> String {
 ///
 /// Synchronous: the caller is already on a blocking thread.
 fn tree_key(path: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
+    let out = crate::wt::command::git_command(path)
         .args(["rev-parse", "HEAD^{tree}"])
         .output()
         .ok()?;
@@ -210,27 +214,27 @@ pub fn search(query: &str, targets: &[Target], options: QueryOptions) -> Results
         ..Default::default()
     };
 
+    // One budget for the whole search, not one per tree: the cap exists to
+    // bound memory, and ten trees each under the cap can still be a lot.
+    let budget = AtomicUsize::new(0);
+
     for key in &keys {
+        if budget.load(Ordering::Relaxed) >= MAX_HITS {
+            results.truncated = true;
+            break;
+        }
         let Some(target) = representative.get(key) else {
             continue;
         };
         let owned = branches.get(key).cloned().unwrap_or_default();
 
-        let (hits, files, truncated) = search_one_tree(target, &matcher);
+        let (hits, files, truncated) = search_one_tree(target, &matcher, &budget);
         results.files_matched += files;
         results.truncated |= truncated;
 
         for mut hit in hits {
             hit.worktrees = owned.clone();
             results.hits.push(hit);
-            if results.hits.len() >= MAX_HITS {
-                results.truncated = true;
-                break;
-            }
-        }
-
-        if results.hits.len() >= MAX_HITS {
-            break;
         }
     }
 
@@ -239,7 +243,11 @@ pub fn search(query: &str, targets: &[Target], options: QueryOptions) -> Results
 
 /// Walk and search one worktree, returning its hits, file count, and whether
 /// the hit cap cut the walk short.
-fn search_one_tree(target: &Target, matcher: &RegexMatcher) -> (Vec<Hit>, usize, bool) {
+fn search_one_tree(
+    target: &Target,
+    matcher: &RegexMatcher,
+    budget: &AtomicUsize,
+) -> (Vec<Hit>, usize, bool) {
     let (tx, rx) = mpsc::channel::<(Vec<Hit>, usize, bool)>();
 
     let mut builder = ignore::WalkBuilder::new(&target.path);
@@ -261,8 +269,15 @@ fn search_one_tree(target: &Target, matcher: &RegexMatcher) -> (Vec<Hit>, usize,
         let mut searcher = SearcherBuilder::new().build();
         let matcher = matcher.clone();
         let root = target.path.clone();
+        let budget = &budget;
 
         Box::new(move |entry| {
+            // Another worker may have filled the budget while this one was
+            // queued; checking first avoids opening files whose hits cannot be
+            // kept.
+            if budget.load(Ordering::Relaxed) >= MAX_HITS {
+                return WalkState::Quit;
+            }
             let Ok(entry) = entry else {
                 return WalkState::Continue;
             };
@@ -285,7 +300,11 @@ fn search_one_tree(target: &Target, matcher: &RegexMatcher) -> (Vec<Hit>, usize,
                 &matcher,
                 entry.path(),
                 UTF8(|line_number, line| {
-                    if collected.len() >= MAX_HITS {
+                    // Claim a slot in the shared budget before collecting. Every
+                    // worker counts against the same total, so the cap bounds
+                    // what is held in memory rather than merely what is reported.
+                    let claimed = budget.fetch_add(1, Ordering::Relaxed);
+                    if claimed >= MAX_HITS {
                         truncated = true;
                         return Ok(false);
                     }
@@ -305,7 +324,7 @@ fn search_one_tree(target: &Target, matcher: &RegexMatcher) -> (Vec<Hit>, usize,
                 if !collected.is_empty() || truncated {
                     let _ = tx.send((std::mem::take(&mut collected), 1, truncated));
                 }
-                if truncated {
+                if truncated || budget.load(Ordering::Relaxed) >= MAX_HITS {
                     return WalkState::Quit;
                 }
             }
@@ -522,5 +541,49 @@ mod tests {
             line: "x".into(),
         };
         assert_eq!(hit.reach(), 2);
+    }
+
+    /// The cap must stop the *walk*, not trim the result afterwards.
+    ///
+    /// A per-file cap does not do this: a query matching a few lines in each of
+    /// very many files accumulates the whole corpus in memory before any limit is
+    /// consulted. The observable consequence is that the walk keeps going — every
+    /// file is still opened and read — and only the report is trimmed. With 600
+    /// files there is no way to reach 5_000 hits without finding the cap, so a
+    /// correct implementation must stop long before the last file.
+    #[test]
+    fn the_hit_cap_stops_the_walk_rather_than_trimming_afterwards() {
+        let dir = tempdir();
+        let files = 600;
+        // 600 x 100 = 60_000 candidate hits against a cap of 5_000.
+        for n in 0..files {
+            let body = "needle\n".repeat(100);
+            std::fs::write(dir.join(format!("f{n:03}.txt")), body).expect("write file");
+        }
+
+        let results = search(
+            "needle",
+            &[Target {
+                branch: "main".into(),
+                path: dir.clone(),
+            }],
+            QueryOptions::default(),
+        );
+
+        assert!(
+            results.truncated,
+            "exceeding the cap must be reported as truncation"
+        );
+        assert!(
+            results.hits.len() <= MAX_HITS,
+            "collected {} hits, above the cap of {MAX_HITS}",
+            results.hits.len()
+        );
+        assert!(
+            results.files_matched < files,
+            "all {files} files were searched, so the walk ran to completion and the \
+             cap only trimmed the report; {} files were read",
+            results.files_matched
+        );
     }
 }

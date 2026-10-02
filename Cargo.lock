@@ -995,21 +995,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "grep-printer"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd76035e87871f51c1ee5b793e32122b3ccf9c692662d9622ef1686ff5321acb"
-dependencies = [
- "bstr",
- "grep-matcher",
- "grep-searcher",
- "log",
- "serde",
- "serde_json",
- "termcolor",
-]
-
-[[package]]
 name = "grep-regex"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2943,15 +2928,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "termcolor"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
-dependencies = [
- "winapi-util",
-]
-
-[[package]]
 name = "termina"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3752,8 +3728,6 @@ dependencies = [
  "ansi-to-tui",
  "arboard",
  "clap",
- "crossterm",
- "grep-printer",
  "grep-regex",
  "grep-searcher",
  "ignore",
@@ -3765,7 +3739,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "unicode-width",
 ]
 
 [[package]]

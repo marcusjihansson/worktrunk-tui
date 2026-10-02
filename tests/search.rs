@@ -124,13 +124,16 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if let Ok(entries) = std::fs::read_dir(self.root.parent().unwrap_or(Path::new("/"))) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.contains("worktrunk-fixture") && entry.path().is_dir() {
-                    let _ = std::fs::remove_dir_all(entry.path());
-                }
-            }
+        // Remove exactly the worktrees git reports, then the repo.
+        //
+        // This used to scan the parent directory for any entry whose name
+        // contained "worktrunk-fixture". That was wrong twice over: this fixture
+        // uses `tempfile`'s names (`.tmpXXXXXX`), so the match never fired and
+        // every worktree leaked into the temp directory — and had any unrelated
+        // directory ever matched, on a shared CI runner it would have deleted a
+        // directory belonging to another job.
+        for path in self.worktree_paths() {
+            let _ = std::fs::remove_dir_all(path);
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }

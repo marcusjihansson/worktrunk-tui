@@ -12,7 +12,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::{Frame, Terminal};
 use std::io::Stdout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use wt_tui::app::{
     App, MergeRequest, Mode, NoticeKind, Pending, REFRESH_INTERVAL, SearchRequest, View,
@@ -29,7 +29,8 @@ enum Event_ {
     Removed(Result<Vec<wt::model::RemoveResult>, String>, String),
     Preview(String),
     SearchDone(search::Results, Duration),
-    SearchContext(String),
+    /// A context body, tagged with the (worktree, rel_path) it was read from.
+    SearchContext(String, wt_tui::app::ContextKey),
     MergeDone(Result<wt::command::MergeOutcome, String>, MergeRequest),
     PrunePreview(
         Result<Vec<wt::command::PruneCandidate>, String>,
@@ -97,6 +98,10 @@ fn main() -> std::process::ExitCode {
 }
 
 async fn run(cli: Cli, repo: PathBuf) -> std::process::ExitCode {
+    // Installed before the terminal is put into raw mode, so a panic from any
+    // point after this leaves a usable shell behind.
+    install_panic_hook();
+
     let mut terminal = match setup() {
         Ok(t) => t,
         Err(e) => {
@@ -155,16 +160,27 @@ async fn run(cli: Cli, repo: PathBuf) -> std::process::ExitCode {
 
         // The editor owns the terminal, so hand it over and take it back. This
         // cannot live in `dispatch_pending`, which has no terminal handle.
-        if let Some((editor, path)) = editor_request {
+        if let Some(launch) = editor_request {
             let _ = restore(&mut terminal);
-            let status = std::process::Command::new(&editor).arg(&path).status();
+            let status = std::process::Command::new(&launch.program)
+                .args(&launch.args)
+                .arg(&launch.path)
+                .status();
             let _ = setup_with(&mut terminal);
+            // Only the program name is echoed. `$EDITOR`'s arguments are not
+            // echoed into the status bar: they are environment-supplied text and
+            // have no business being rendered.
             match status {
                 Ok(s) if s.success() => {
-                    app.set_notice(format!("closed {editor}"), NoticeKind::Info)
+                    app.set_notice(format!("closed {}", launch.program), NoticeKind::Info)
                 }
-                Ok(s) => app.set_notice(format!("{editor} exited {s}"), NoticeKind::Error),
-                Err(e) => app.set_notice(format!("could not run {editor}: {e}"), NoticeKind::Error),
+                Ok(s) => {
+                    app.set_notice(format!("{} exited {s}", launch.program), NoticeKind::Error)
+                }
+                Err(e) => app.set_notice(
+                    format!("could not run {}: {e}", launch.program),
+                    NoticeKind::Error,
+                ),
             }
         }
 
@@ -178,13 +194,31 @@ async fn run(cli: Cli, repo: PathBuf) -> std::process::ExitCode {
             preview_for = Some(path);
         }
 
-        // Load the file around the selected search hit.
+        // Load the file around the selected search hit, once per file.
+        //
+        // The key is (worktree, rel_path), not rel_path alone: two worktrees can
+        // each hold a `src/main.rs` that matches, and showing one under the
+        // other's hit would be quietly wrong. This block owns the decision
+        // because only it can resolve a hit's worktree.
         if app.view == View::Search
-            && app.search.context_body.is_empty()
             && let Some(hit) = app.selected_hit().cloned()
-            && let Some(path) = worktree_for_branch(&app, hit.worktrees.first())
+            && let Some(worktree) = worktree_for_branch(&app, hit.worktrees.first())
         {
-            spawn_search_context(&app, path, &hit.rel_path, &events);
+            let key = (
+                worktree.to_string_lossy().into_owned(),
+                hit.rel_path.clone(),
+            );
+            if app.search.context_path.as_ref() != Some(&key) {
+                // The body on screen belongs to a different file; drop it rather
+                // than leave it rendered under this hit.
+                app.search.context_body.clear();
+                // A read already in flight for this file will populate it;
+                // spawning another would double the I/O on every keystroke.
+                if app.search.context_loading.as_ref() != Some(&key) {
+                    app.search.context_loading = Some(key.clone());
+                    spawn_search_context(worktree, hit.rel_path.clone(), key, &events);
+                }
+            }
         }
 
         tokio::select! {
@@ -236,7 +270,7 @@ fn dispatch_pending(
     repo: &PathBuf,
     scope: wt::ListScope,
     events: &tokio::sync::mpsc::UnboundedSender<Event_>,
-) -> Option<(String, PathBuf)> {
+) -> Option<wt_tui::app::EditorLaunch> {
     let Pending {
         create,
         remove,
@@ -408,7 +442,17 @@ fn handle_event(
             app.search.results = results;
         }
 
-        Event_::SearchContext(body) => app.search.context_body = body,
+        Event_::SearchContext(body, key) => {
+            // A response only counts if it is the read still being waited for.
+            // Anything else is a read the user has already navigated away from,
+            // and showing it would put one file's contents under another's name.
+            if app.search.context_loading.as_ref() != Some(&key) {
+                return;
+            }
+            app.search.context_loading = None;
+            app.search.context_path = Some(key);
+            app.search.context_body = body;
+        }
 
         Event_::MergeDone(result, request) => {
             app.mode = Mode::Normal;
@@ -467,7 +511,16 @@ fn handle_event(
 
         Event_::PrunePreview(result, min_age) => match result {
             Ok(candidates) => {
+                // Only populate the dialog if it is still the thing being waited
+                // on. Cancelling while a dry run was in flight leaves `mode` at
+                // Normal, and reopening the dialog the user just dismissed — with
+                // a possibly different age — would be worse than dropping it.
+                if !matches!(app.mode, Mode::Busy) {
+                    return;
+                }
                 let age = min_age.unwrap_or_else(|| "1d".to_string());
+                // The age and the candidates arrive from the same request, so
+                // the list on screen is always the list that will be pruned.
                 app.mode = Mode::ConfirmPrune {
                     candidates,
                     min_age: age,
@@ -520,19 +573,47 @@ fn worktree_for_branch(app: &App, branch: Option<&String>) -> Option<PathBuf> {
 }
 
 /// Read a file so the selected hit's surrounding lines can be shown.
+///
+/// The read is capped. This loads the *whole* file purely to render a window
+/// around one line, so an unbounded read would let a single large tracked file
+/// exhaust memory — and the search walker will happily match one. Refusing is
+/// better than truncating silently: a prefix could cut off the very line that
+/// was selected, and the pane would then highlight nothing without saying why.
+///
+/// The result is tagged with `key` so a slow read that lands after the selection
+/// has moved on can be discarded instead of rendered against the wrong hit.
 fn spawn_search_context(
-    app: &App,
     worktree: PathBuf,
-    rel_path: &str,
+    rel_path: String,
+    key: wt_tui::app::ContextKey,
     events: &tokio::sync::mpsc::UnboundedSender<Event_>,
 ) {
-    let _ = app;
-    let path = worktree.join(rel_path);
+    let path = worktree.join(&rel_path);
     let tx = events.clone();
     tokio::task::spawn_blocking(move || {
-        let body = std::fs::read_to_string(&path).unwrap_or_default();
-        let _ = tx.send(Event_::SearchContext(body));
+        let body = read_capped(&path);
+        let _ = tx.send(Event_::SearchContext(body, key));
     });
+}
+
+/// Largest file the context pane will read into memory.
+const MAX_CONTEXT_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Read `path` as UTF-8, or explain why it was not read.
+fn read_capped(path: &Path) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_CONTEXT_BYTES => format!(
+            "{name} is {size} — too large to preview (limit {limit})",
+            name = path.file_name().map_or_else(
+                || path.display().to_string(),
+                |n| n.to_string_lossy().into_owned()
+            ),
+            size = meta.len(),
+            limit = MAX_CONTEXT_BYTES,
+        ),
+        Ok(_) => std::fs::read_to_string(path).unwrap_or_else(|e| format!("could not read: {e}")),
+        Err(e) => format!("could not read: {e}"),
+    }
 }
 
 /// Kick off a `wt list` load without blocking the loop.
@@ -588,11 +669,11 @@ fn spawn_input() -> tokio::sync::mpsc::UnboundedReceiver<std::io::Result<Event>>
 
 /// Start a background `git` run for the preview pane.
 fn spawn_preview(app: &mut App, path: PathBuf, tx: &tokio::sync::mpsc::UnboundedSender<Event_>) {
-    let args = ui::preview::Preview::command(app.preview.tab, &path);
-    app.preview.begin_load(path);
+    let args = ui::preview::Preview::command(app.preview.tab);
+    app.preview.begin_load(path.clone());
     let tx = tx.clone();
     tokio::task::spawn_blocking(move || {
-        let body = match std::process::Command::new("git").args(&args).output() {
+        let body = match wt::command::git_command(&path).args(&args).output() {
             Ok(output) if output.status.success() => {
                 let out = String::from_utf8_lossy(&output.stdout).into_owned();
                 if out.trim().is_empty() {
@@ -677,6 +758,37 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
     ui::preview_view::render(frame, panes[1], app);
 }
 
+/// Put the terminal back the way it was found.
+///
+/// Split out from [`restore`] so the panic hook can use it without a `Terminal`
+/// handle. Disabling raw mode first matters: it has more side effects than
+/// leaving the alternate screen does.
+fn restore_console() -> std::io::Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        std::io::stdout(),
+        LeaveAlternateScreen,
+        ratatui::crossterm::cursor::Show
+    )
+}
+
+/// Restore the terminal before a panic is reported.
+///
+/// Without this, a panic anywhere in the event loop unwinds straight past
+/// [`restore`] and leaves the terminal in raw mode, on the alternate screen,
+/// with the cursor hidden — the user's shell looks dead until they run `reset`.
+///
+/// Ratatui's `try_init` installs an equivalent hook, but the copy here is
+/// preferred so terminal handling stays in one place: ratatui's restores raw
+/// mode and the alternate screen but does not re-show the cursor.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore_console();
+        previous(info);
+    }));
+}
+
 fn setup() -> std::io::Result<Terminal<Backend>> {
     let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     setup_with(&mut terminal)?;
@@ -695,12 +807,6 @@ fn setup_with(terminal: &mut Terminal<Backend>) -> std::io::Result<()> {
 }
 
 fn restore(terminal: &mut Terminal<Backend>) -> std::io::Result<()> {
-    disable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(
-        stdout,
-        LeaveAlternateScreen,
-        ratatui::crossterm::cursor::Show
-    )?;
+    restore_console()?;
     terminal.show_cursor()
 }

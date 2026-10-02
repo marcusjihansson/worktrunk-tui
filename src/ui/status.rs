@@ -20,6 +20,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             branch,
             target,
             keep_worktree,
+            ..
         } => Some(format!(
             "merge {branch} → {target}{}?  (y/n, w keep worktree)",
             if *keep_worktree {

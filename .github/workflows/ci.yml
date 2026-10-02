@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+# This job compiles and runs code from the pull request, so the token is held to
+# the minimum. `pull_request` (not `pull_request_target`) already gives fork PRs a
+# read-only token, but a same-repo branch PR would otherwise inherit the
+# repository's default permissions, which are often write.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -19,14 +26,20 @@ jobs:
         os: [macos-latest, ubuntu-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to commit SHAs rather than floating tags: anyone able
+      # to move `v4` could otherwise run their code with this job's token. The
+      # trailing comment records the release each SHA corresponds to, so
+      # Dependabot-style updates stay reviewable.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      # Pinned to a SHA, so this no longer tracks `stable` automatically. Bump it
+      # with the rest.
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2.7.5
 
       # The contract test validates wt-tui's model against the JSON Schema
       # worktrunk publishes, and the live tests exercise the real `wt` binary.
@@ -43,3 +56,34 @@ jobs:
 
       # The binary must build clean for the current target.
       - run: cargo build --release
+
+  audit:
+    name: Dependency hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      # Installed from crates.io rather than pulled in as a GitHub Action: one
+      # less third party whose code runs in this job, and `--locked` pins its own
+      # dependency graph.
+      - name: Install cargo-audit and cargo-machete
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-machete --locked
+
+      # Known vulnerabilities in the dependency graph. wt-tui is distributed as
+      # an installable plugin, so its transitive graph becomes someone else's
+      # problem once it ships.
+      #
+      # Expect a `yanked` warning for `yoke-derive`, reached only through
+      # `jsonschema` — a dev-dependency used by the contract test, and not part
+      # of the shipped binary. `cargo audit` still exits 0 on warnings.
+      - run: cargo audit
+
+      # Unused direct dependencies. They cost build time and widen the supply
+      # chain for nothing, and `cargo machete` is the only thing that notices
+      # them — clippy does not.
+      - run: cargo machete

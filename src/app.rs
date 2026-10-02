@@ -40,6 +40,16 @@ pub enum Mode {
     ConfirmMerge {
         branch: String,
         target: String,
+        /// The confirmed row's worktree, captured when the dialog opened.
+        ///
+        /// Captured deliberately. `wt merge` merges the *current* branch into the
+        /// target, so the worktree is what decides which branch is merged — and
+        /// with `keep_worktree` off it is also what decides which branch is
+        /// deleted. Re-reading the selection at execute time would merge the
+        /// wrong branch: a refresh replaces `rows` (and may fall back to an
+        /// index) while the dialog is open, so the cursor can silently move to
+        /// a different row between the user reading the prompt and pressing `y`.
+        worktree: PathBuf,
         keep_worktree: bool,
     },
     /// Confirming a bulk prune, bound to `P`.
@@ -60,6 +70,16 @@ pub enum View {
     Search,
 }
 
+/// Identifies the file a context body was read from: the worktree, and the path
+/// within it.
+///
+/// Keyed on both, not on the relative path alone. Two worktrees can each hold a
+/// `src/main.rs` that a query matches, and because search deduplicates by tree
+/// rather than by path those are genuinely different hits with identical
+/// `rel_path` values. Keying on the relative path alone would show one
+/// worktree's file under another's hit.
+pub type ContextKey = (String, String);
+
 /// The search session: the query, its results, and the file being previewed.
 #[derive(Debug, Default)]
 pub struct SearchState {
@@ -67,6 +87,14 @@ pub struct SearchState {
     pub results: crate::search::Results,
     /// The file around the selected hit.
     pub context_body: String,
+    /// The file `context_body` holds, if any.
+    pub context_path: Option<ContextKey>,
+    /// The file with a read in flight, if any.
+    ///
+    /// Tracked so moving the cursor does not spawn a read per keystroke, and so
+    /// a response for a file the user has navigated away from is discarded
+    /// rather than shown against the wrong hit.
+    pub context_loading: Option<ContextKey>,
     /// Index into `results.hits`.
     pub selected: usize,
     pub scroll: u16,
@@ -87,6 +115,12 @@ impl SearchState {
     }
 
     /// Move the cursor, clamped to the result list.
+    ///
+    /// The context body is *not* cleared here. It holds a whole file, so it stays
+    /// valid for every hit inside that file, and clearing it per keystroke is
+    /// what made each `j` re-read from disk. Deciding whether the body on screen
+    /// still matches the selected hit needs the hit's *worktree* as well as its
+    /// path, which only the event loop can resolve — see [`ContextKey`].
     pub fn move_by(&mut self, delta: isize) {
         if self.results.hits.is_empty() {
             self.selected = 0;
@@ -95,7 +129,6 @@ impl SearchState {
         let len = self.results.hits.len() as isize;
         self.selected = (self.selected as isize + delta).clamp(0, len - 1) as usize;
         self.scroll = 0;
-        self.context_body.clear();
     }
 
     /// Set the query and clear stale results.
@@ -107,6 +140,8 @@ impl SearchState {
             self.query = query;
             self.results = crate::search::Results::default();
             self.context_body.clear();
+            self.context_path = None;
+            self.context_loading = None;
             self.selected = 0;
             self.scroll = 0;
         }
@@ -126,12 +161,22 @@ pub struct Notice {
     pub kind: NoticeKind,
 }
 
+/// An editor invocation queued from the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorLaunch {
+    pub program: String,
+    /// Flags from `$EDITOR`, which precede the path.
+    pub args: Vec<String>,
+    /// The worktree to open.
+    pub path: PathBuf,
+}
+
 /// Work handed from the key handler to the event loop.
 #[derive(Debug, Default)]
 pub struct Pending {
     pub create: Option<String>,
     pub remove: Option<(String, bool)>,
-    pub editor: Option<(String, PathBuf)>,
+    pub editor: Option<EditorLaunch>,
     pub refresh: bool,
     /// True when the preview tab changed and its body must be re-fetched.
     pub preview_stale: bool,
@@ -282,6 +327,22 @@ impl App {
             .map(PathBuf::from)
     }
 
+    /// The row whose worktree is `path`, regardless of where the cursor is.
+    ///
+    /// Confirmation dialogs use this instead of `selected_item` so the facts on
+    /// screen describe the row that will actually be acted on. A refresh can
+    /// move the cursor between opening a dialog and confirming it, and showing
+    /// another branch's ahead/behind and conflict warnings under this
+    /// branch's name is how a user confirms the wrong thing.
+    pub fn item_for_worktree(&self, path: &std::path::Path) -> Option<&Item> {
+        self.rows.iter().find(|item| {
+            item.worktree
+                .as_ref()
+                .and_then(|w| w.path.as_deref())
+                .is_some_and(|p| std::path::Path::new(p) == path)
+        })
+    }
+
     /// True only before the very first load, so the first paint can show a
     /// loading state rather than an empty table.
     pub fn initial_loading(&self) -> bool {
@@ -403,7 +464,18 @@ impl App {
         // Dispatch on a clone of the mode so a handler can mutate `self`
         // without borrowing the mode twice.
         match self.mode.clone() {
-            Mode::Busy => return true,
+            Mode::Busy => {
+                // Nothing that could queue another command is honoured while
+                // one is running. Cancel and quit still are: a `wt` call that
+                // hangs must not leave the user unable to back out of the
+                // dialog it was opened from.
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => self.mode = Mode::Normal,
+                    KeyCode::Char('q') => self.should_quit = true,
+                    _ => {}
+                }
+                return true;
+            }
             Mode::Filtering(buffer) => return self.on_key_filtering(key, &buffer),
             Mode::Creating(buffer) => return self.on_key_creating(key, &buffer),
             Mode::Searching(buffer) => return self.on_key_searching(key, &buffer),
@@ -417,15 +489,13 @@ impl App {
             Mode::ConfirmMerge {
                 branch,
                 target,
+                worktree,
                 keep_worktree,
             } => {
-                return self.on_key_merge(key, branch, target, keep_worktree);
+                return self.on_key_merge(key, branch, target, worktree, keep_worktree);
             }
-            Mode::ConfirmPrune {
-                candidates,
-                min_age,
-            } => {
-                return self.on_key_prune(key, candidates, min_age);
+            Mode::ConfirmPrune { min_age, .. } => {
+                return self.on_key_prune(key, min_age);
             }
             Mode::Normal => {}
         }
@@ -653,10 +723,29 @@ impl App {
             return;
         };
 
+        // A merge needs a worktree path, not merely a worktree: `wt merge`
+        // operates on the worktree's current branch, so the path is the thing
+        // that decides what gets merged and what gets deleted.
+        let Some(worktree) = item
+            .worktree
+            .as_ref()
+            .and_then(|w| w.path.as_deref())
+            .map(PathBuf::from)
+        else {
+            self.set_notice(
+                format!("{branch} has no worktree path, so there is nothing to merge from"),
+                NoticeKind::Error,
+            );
+            return;
+        };
+
         let target = self.default_branch().unwrap_or("main").to_string();
+        // `worktree` is captured here so the executed command cannot drift from
+        // what this dialog describes. See `Mode::ConfirmMerge`.
         self.mode = Mode::ConfirmMerge {
             branch,
             target,
+            worktree,
             keep_worktree: false,
         };
     }
@@ -666,6 +755,7 @@ impl App {
         key: KeyEvent,
         branch: String,
         target: String,
+        worktree: PathBuf,
         keep_worktree: bool,
     ) -> bool {
         match key.code {
@@ -674,31 +764,29 @@ impl App {
                 self.mode = Mode::ConfirmMerge {
                     branch,
                     target,
+                    worktree,
                     keep_worktree: !keep_worktree,
                 };
             }
             KeyCode::Char('y') | KeyCode::Enter => {
-                if let Some(worktree) = self.selected_path() {
-                    self.pending.merge = Some(MergeRequest {
-                        worktree,
-                        branch,
-                        target,
-                        keep_worktree,
-                    });
-                    self.mode = Mode::Busy;
-                }
+                // The captured worktree, never a fresh read of the selection:
+                // a refresh can move the cursor to a different row while this
+                // dialog is open, and `keep_worktree` off means the wrong row
+                // would also be deleted. See `Mode::ConfirmMerge`.
+                self.pending.merge = Some(MergeRequest {
+                    worktree,
+                    branch,
+                    target,
+                    keep_worktree,
+                });
+                self.mode = Mode::Busy;
             }
             _ => {}
         }
         true
     }
 
-    fn on_key_prune(
-        &mut self,
-        key: KeyEvent,
-        candidates: Vec<command::PruneCandidate>,
-        min_age: String,
-    ) -> bool {
+    fn on_key_prune(&mut self, key: KeyEvent, min_age: String) -> bool {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') => self.mode = Mode::Normal,
             // Cycling the age guard matters: with the default of 1d, prune
@@ -709,12 +797,21 @@ impl App {
                     "1d" => "7d",
                     _ => "0",
                 };
-                self.pending.prune_preview = true;
-                self.mode = Mode::ConfirmPrune {
-                    candidates,
-                    min_age: next.to_string(),
-                };
+                // Deliberately does *not* write the new age into `mode`. The
+                // candidate list on screen was selected by a `--dry-run` at the
+                // current age, so labelling it with a different age would
+                // describe a different set of worktrees than `y` actually prunes
+                // — and `--min-age 0` is a strict superset of the shown list,
+                // including worktrees created seconds ago.
+                //
+                // Instead, ask for a fresh dry run. `Event_::PrunePreview` sets
+                // the age and the candidates together from the same request, so
+                // the two cannot disagree. `Busy` in the meantime means `y` does
+                // nothing, which is the right behaviour for a destructive
+                // confirmation whose contents are being recomputed.
                 self.pending.prune_age = Some(next.to_string());
+                self.pending.prune_preview = true;
+                self.mode = Mode::Busy;
             }
             KeyCode::Char('y') | KeyCode::Enter => {
                 self.pending.prune = Some(min_age);
@@ -881,13 +978,28 @@ impl App {
             .selected_item()
             .and_then(|i| i.pr.as_ref())
             .and_then(|p| p.url.clone());
-        match url {
-            Some(url) => {
-                if let Err(e) = open::that_detached(&url) {
-                    self.set_notice(format!("could not open {url}: {e}"), NoticeKind::Error);
-                }
-            }
-            None => self.set_notice("no pull request for this branch", NoticeKind::Info),
+        let Some(url) = url else {
+            self.set_notice("no pull request for this branch", NoticeKind::Info);
+            return;
+        };
+
+        // Only web URLs reach the desktop handler. `open` dispatches *any*
+        // registered scheme, so a `vscode://`, `file://` or other custom URL
+        // would launch that handler with an attacker-chosen argument. In practice
+        // `pr.url` is forge-generated and not attacker-settable — but on a
+        // self-hosted forge the host derives from `remote.origin.url`, which is
+        // repository content, and this is a one-line check.
+        let scheme = url.split_once(':').map(|(scheme, _)| scheme);
+        if !matches!(scheme, Some("http" | "https")) {
+            self.set_notice(
+                format!("refusing to open {url}: not an http(s) URL"),
+                NoticeKind::Error,
+            );
+            return;
+        }
+
+        if let Err(e) = open::that_detached(&url) {
+            self.set_notice(format!("could not open {url}: {e}"), NoticeKind::Error);
         }
     }
 
@@ -896,7 +1008,13 @@ impl App {
             return;
         };
         match command::editor_command() {
-            Some(editor) => self.pending.editor = Some((editor, path)),
+            Some(editor) => {
+                self.pending.editor = Some(EditorLaunch {
+                    program: editor.program,
+                    args: editor.args,
+                    path,
+                });
+            }
             None => self.set_notice("set $EDITOR to open a worktree", NoticeKind::Info),
         }
     }

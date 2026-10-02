@@ -80,17 +80,29 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // Remove sibling worktrees and the bare remote the fixture created.
-        if let Ok(entries) = std::fs::read_dir(self.root.parent().unwrap_or(Path::new("/"))) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with(self.root.file_name().unwrap().to_string_lossy().as_ref())
-                    && entry.path().is_dir()
-                {
-                    let _ = std::fs::remove_dir_all(entry.path());
+        // Ask git which directories this repository actually created, instead of
+        // scanning the parent for names that merely start with the fixture's.
+        // The prefix scan worked only because worktrunk happens to name siblings
+        // `<repo>-<branch>`, and it would `remove_dir_all` anything else in that
+        // directory sharing the prefix — on a shared CI runner, that can be a
+        // directory belonging to another job.
+        let mut cmd = git();
+        cmd.arg("-C")
+            .arg(&self.root)
+            .args(["worktree", "list", "--porcelain"]);
+        if let Ok(out) = cmd.output()
+            && out.status.success()
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some(path) = line.strip_prefix("worktree ") {
+                    let _ = std::fs::remove_dir_all(path);
                 }
             }
         }
+
+        // The bare remote is a sibling created by `Fixture::new`, and is not a
+        // worktree, so it is named explicitly.
+        let _ = std::fs::remove_dir_all(self.root.with_extension("remote.git"));
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

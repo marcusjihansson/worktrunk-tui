@@ -41,12 +41,20 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// The sibling prefix this fixture owns, for cleaning up its worktrees.
-    fn dir_name(&self) -> String {
-        self.root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
+    /// Every worktree path git reports for this repository, including the main
+    /// one. Used for cleanup so nothing outside the fixture is ever a deletion
+    /// candidate.
+    fn worktree_paths(&self) -> Vec<PathBuf> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("git worktree list");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree ").map(PathBuf::from))
+            .collect()
     }
 }
 
@@ -137,17 +145,16 @@ fn unique_dir(prefix: &str) -> PathBuf {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // Remove every sibling path this fixture created: the repo itself and one
-        // worktree per branch.
-        if let Some(parent) = self.root.parent() {
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.starts_with(&self.dir_name()) && entry.path().is_dir() {
-                        let _ = std::fs::remove_dir_all(entry.path());
-                    }
-                }
-            }
+        // Remove exactly the worktrees git reports, then the repo.
+        //
+        // This used to scan the parent for any directory whose name started with
+        // the fixture's. That worked, but it meant cleanup authority was decided
+        // by a name prefix in a shared directory: on a CI runner whose
+        // `TMPDIR` is shared, an unrelated directory sharing the prefix would
+        // have been deleted. `git worktree list` names the paths this
+        // repository actually owns.
+        for path in self.worktree_paths() {
+            let _ = std::fs::remove_dir_all(path);
         }
         let _ = std::fs::remove_dir_all(&self.root);
     }

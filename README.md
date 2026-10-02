@@ -183,6 +183,47 @@ if you want it listed in config instead:
 tui = "wt-tui"
 ```
 
+## Using it as a Herdr plugin
+
+The repository is also a [Herdr](https://herdr.dev) plugin. Herdr's marketplace
+is an automatic index of public repositories carrying the `herdr-plugin` topic
+and a parseable `herdr-plugin.toml` — there is no submission step or review
+queue, and listings are not vetted. Anyone can install it directly:
+
+```
+herdr plugin install marcusjihansson/worktrunk-tui
+```
+
+Two requirements, neither of which Herdr installs for you:
+
+- **`wt` on `PATH`.** wt-tui is a frontend for worktrunk, so without it the
+  dashboard reports that it cannot run `wt`.
+- **A Rust toolchain.** `wt-tui` is not on crates.io, so the plugin builds it from
+  source at install time (`cargo build --release`).
+
+The plugin contributes one action, `open`, which opens the dashboard as a
+temporary overlay pane over the current workspace and restores your layout when
+you quit it. To bind it to a key in `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+w"
+type = "plugin_action"
+command = "marcusjihansson.wt-tui.open"
+description = "open worktrunk worktrees"
+```
+
+Herdr runs plugin commands with the *plugin's* directory as their working
+directory, so `herdr/open.sh` works out which repository you meant from
+`HERDR_PLUGIN_CONTEXT_JSON` — the invoking pane's `focused_pane_cwd`, falling back
+to the workspace's — verifies it really is a git repository, and passes it
+through `WT_TUI_REPO` to the pane. Set `WT_TUI_REPO` yourself to override, which
+is the escape hatch if you keep your projects somewhere unusual.
+
+Nothing is sandboxed: like any Herdr plugin this runs as you, with your
+environment. The build command is the only code the installer runs before you
+see the dashboard, and it is a plain `cargo build`.
+
 ## Development
 
 ```

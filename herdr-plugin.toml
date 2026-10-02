@@ -1,0 +1,34 @@
+# Herdr plugin manifest.
+#
+# Publishing: herdr's marketplace is an automatic index of public repositories
+# tagged `herdr-plugin` that contain a parseable manifest. There is no
+# submission step, so adding that topic is what publishes this.
+#
+# Keep `version` in step with the `version` in Cargo.toml — Herdr reads this one.
+
+id = "marcusjihansson.wt-tui"
+name = "Worktrunk TUI"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Browse, search, merge and remove worktrunk worktrees from a TUI. Needs the `wt` binary on PATH and a Rust toolchain to build."
+platforms = ["linux", "macos"]
+
+# Runs during `herdr plugin install`. Building from source is the only option
+# here: wt-tui is not on crates.io. Herdr reports a missing toolchain but does
+# not install one, so a Rust toolchain has to be present.
+[[build]]
+command = ["cargo", "build", "--release"]
+
+# Opens the dashboard over the active pane.
+[[actions]]
+id = "open"
+title = "Open worktrunk worktrees"
+command = ["sh", "herdr/open.sh"]
+
+# `overlay` is a temporary zoomed pane that restores the previous focus when the
+# dashboard exits, which suits a browse-and-quit TUI better than a split.
+[[panes]]
+id = "dashboard"
+title = "Worktrunk worktrees"
+placement = "overlay"
+command = ["sh", "herdr/run.sh"]

@@ -240,6 +240,78 @@ async fn create_and_remove_round_trip() {
 }
 
 #[tokio::test]
+async fn switch_reports_the_target_worktree() {
+    require_wt!();
+    let fx = Fixture::new();
+
+    wt_tui::wt::command::create(&fx.root, "switch-me", None)
+        .await
+        .expect("create should succeed");
+
+    // Plain `wt switch <branch>`: the arguments wt-tui sends must be ones
+    // worktrunk accepts, and the JSON must fit `SwitchResult`.
+    let switched = wt_tui::wt::command::switch(&fx.root, "switch-me")
+        .await
+        .expect("switch should succeed");
+    assert_eq!(switched.branch.as_deref(), Some("switch-me"));
+    assert!(
+        switched.path.is_some(),
+        "the target worktree path is reported"
+    );
+
+    let unknown = wt_tui::wt::command::switch(&fx.root, "no-such-branch").await;
+    assert!(
+        unknown.is_err(),
+        "switching nowhere must be an error the UI can show"
+    );
+}
+
+/// The premise of switching from inside the TUI: `wt switch` cannot move the
+/// shell itself, it writes the target directory into the file named by
+/// `WORKTRUNK_DIRECTIVE_CD_FILE`, and the shell wrapper `cd`s there once wt-tui
+/// has exited. If a `--format=json` switch stopped writing that directive,
+/// quitting on success would silently leave the shell where it was.
+#[tokio::test]
+async fn switching_writes_the_path_the_shell_wrapper_follows() {
+    require_wt!();
+    let fx = Fixture::new();
+    fx.wt(&["switch", "--create", "directive", "--no-cd", "-y"]);
+
+    let target = wt_tui::wt::command::list(&fx.root, wt_tui::wt::ListScope::WORKTREES)
+        .await
+        .expect("list")
+        .items
+        .into_iter()
+        .find(|i| i.branch.as_deref() == Some("directive"))
+        .and_then(|i| i.worktree.and_then(|w| w.path))
+        .expect("the new worktree path");
+
+    let directive = tempfile::NamedTempFile::new().expect("tempfile");
+
+    // `--format=json` is the form wt-tui sends, so the directive has to be
+    // written for *this* invocation, not only for the plain-text one.
+    let out = wt_bin()
+        .arg("-C")
+        .arg(&fx.root)
+        .args(["switch", "directive", "-y", "--format=json"])
+        .env("WORKTRUNK_DIRECTIVE_CD_FILE", directive.path())
+        .output()
+        .expect("run wt");
+    assert!(
+        out.status.success(),
+        "wt switch failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let written = std::fs::read_to_string(directive.path()).expect("read directive");
+    assert_eq!(
+        written.trim(),
+        target,
+        "the directive must hold the worktree the shell will move to"
+    );
+}
+
+#[tokio::test]
 async fn a_dirty_worktree_is_refused_without_force() {
     require_wt!();
     let fx = Fixture::new();

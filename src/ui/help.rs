@@ -13,6 +13,7 @@ const KEYS: &[(&str, &str)] = &[
     ("↑ ↓  (preview)", "scroll the preview pane"),
     ("t", "cycle preview tab (diff / log)"),
     ("/", "filter (live; Enter commits, Esc clears)"),
+    ("Enter", "switch to the selected worktree"),
     ("n", "create a worktree for a new branch"),
     ("d", "remove the selected worktree"),
     ("m", "merge the selected branch into the default branch"),

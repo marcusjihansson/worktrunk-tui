@@ -185,6 +185,10 @@ pub struct Pending {
     /// A merge to run: the source worktree, the target branch, and whether to
     /// keep the worktree.
     pub merge: Option<MergeRequest>,
+    /// Switch to the selected worktree: a branch name, or a path for a
+    /// detached worktree. A successful switch quits the TUI so the shell
+    /// wrapper can `cd` to the directive file `wt switch` wrote.
+    pub switch: Option<String>,
     /// Load the prune candidate list without removing anything.
     pub prune_preview: bool,
     /// A min-age override chosen in the prune dialog, applied to the preview
@@ -582,6 +586,14 @@ impl App {
                 };
             }
             KeyCode::Char('n') => self.mode = Mode::Creating(String::new()),
+            KeyCode::Enter => {
+                // Search consumes Enter for re-running the query before this
+                // is reached, and dialogs consume it as confirmation, so this
+                // arm is only the worktree table.
+                if self.view == View::Worktrees {
+                    self.begin_switch();
+                }
+            }
             KeyCode::Char('d') => self.begin_remove(),
             KeyCode::Char('m') => self.begin_merge(),
             // `s` toggles the view. Entering it focuses the query when there is no query
@@ -696,6 +708,39 @@ impl App {
         .iter()
         .flatten()
         .any(|f| f.to_lowercase().contains(&needle))
+    }
+
+    /// Switch to the selected row's worktree, queuing `wt switch`.
+    ///
+    /// The target is the branch name when there is one, else the worktree
+    /// path: a detached worktree has no branch, and a path is the only name
+    /// it has. A branch-only row (no worktree yet) switches by branch, which
+    /// creates the worktree — the same as the picker's `--branches` rows.
+    /// The current worktree is a no-op with a notice; switching to yourself
+    /// would only rewrite the directive file with where you already are.
+    fn begin_switch(&mut self) {
+        let Some(item) = self.selected_item() else {
+            return;
+        };
+        if item.worktree.as_ref().is_some_and(|w| w.current) {
+            self.set_notice(format!("already on {}", item.label()), NoticeKind::Info);
+            return;
+        }
+        let target = item.branch.clone().or_else(|| {
+            item.worktree
+                .as_ref()
+                .and_then(|w| w.path.clone())
+        });
+        match target {
+            Some(target) => {
+                self.pending.switch = Some(target);
+                self.mode = Mode::Busy;
+            }
+            None => self.set_notice(
+                "this row has no branch or path to switch to",
+                NoticeKind::Error,
+            ),
+        }
     }
 
     /// Open the merge dialog for the selected row.

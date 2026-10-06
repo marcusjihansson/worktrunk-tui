@@ -207,6 +207,21 @@ pub async fn create(repo: &Path, branch: &str, base: Option<&str>) -> Result<Swi
     extract_json(&stdout)
 }
 
+/// Switch to an existing worktree by branch name or path.
+///
+/// Unlike [`create`], this passes no `--no-cd`: changing the shell's directory
+/// is the entire point. The shell wrapper (`WORKTRUNK_DIRECTIVE_CD_FILE`)
+/// performs the `cd` after wt-tui exits, so a successful switch means quitting.
+/// `--format=json` still writes the directive file; the human line goes to
+/// stderr and only the JSON is parsed here.
+pub async fn switch(repo: &Path, target: &str) -> Result<SwitchResult, String> {
+    let mut cmd = wt_command(repo);
+    cmd.args(["switch", target, "-y", "--format=json"]);
+
+    let (stdout, _) = run(cmd).await?;
+    extract_json(&stdout)
+}
+
 /// Merge a branch into `target`.
 ///
 /// # Direction matters

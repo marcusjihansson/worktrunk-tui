@@ -45,6 +45,7 @@ wt tui          # because the binary is named wt-tui, worktrunk exposes it here
 | `Tab` | Switch focus between table and preview |
 | `t` | Cycle preview tab (diff / log) |
 | `/` | Filter (live; `Enter` commits, `Esc` clears) |
+| `Enter` | Switch to the selected worktree |
 | `n` | Create a worktree for a new branch |
 | `d` | Remove the selected worktree |
 | `m` | Merge the selected branch into the default branch |

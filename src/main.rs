@@ -32,6 +32,7 @@ enum Event_ {
     /// A context body, tagged with the (worktree, rel_path) it was read from.
     SearchContext(String, wt_tui::app::ContextKey),
     MergeDone(Result<wt::command::MergeOutcome, String>, MergeRequest),
+    Switched(Result<wt::model::SwitchResult, String>, String),
     PrunePreview(
         Result<Vec<wt::command::PruneCandidate>, String>,
         Option<String>,
@@ -279,6 +280,7 @@ fn dispatch_pending(
         preview_stale,
         search: search_request,
         merge,
+        switch,
         prune_preview,
         prune,
         prune_age,
@@ -319,6 +321,16 @@ fn dispatch_pending(
             let result =
                 wt::command::merge(&request.worktree, &request.target, request.keep_worktree).await;
             let _ = tx.send(Event_::MergeDone(result, request));
+        });
+    }
+
+    if let Some(target) = switch {
+        app.set_notice(format!("switching to {target}…"), NoticeKind::Info);
+        let repo = repo.clone();
+        let tx = events.clone();
+        tokio::spawn(async move {
+            let result = wt::command::switch(&repo, &target).await;
+            let _ = tx.send(Event_::Switched(result, target));
         });
     }
 
@@ -507,6 +519,25 @@ fn handle_event(
             }
             *preview_for = None;
             fetch(repo, scope, false, events);
+        }
+
+        Event_::Switched(result, target) => {
+            // A successful `wt switch` wrote the directive file the shell
+            // wrapper reads, which only takes effect once wt-tui exits — so
+            // quit. The notice would never be seen, so none is set. A failure
+            // leaves no directive behind and stays in the TUI with a reason.
+            match result {
+                Ok(_) => {
+                    app.should_quit = true;
+                }
+                Err(e) => {
+                    app.mode = Mode::Normal;
+                    app.set_notice(
+                        format!("could not switch to {target}: {e}"),
+                        NoticeKind::Error,
+                    );
+                }
+            }
         }
 
         Event_::PrunePreview(result, min_age) => match result {

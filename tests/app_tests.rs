@@ -778,6 +778,98 @@ fn declining_a_prune_removes_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// Switch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn enter_queues_a_switch_to_the_selected_branch() {
+    let mut app = app_with(vec![
+        worktree_item("main", "/repo", true),
+        worktree_item("feature", "/repo.feature", false),
+    ]);
+    app.on_key(key(KeyCode::Char('j')));
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.pending.switch.as_deref(), Some("feature"));
+    assert!(
+        matches!(app.mode, Mode::Busy),
+        "the TUI waits while `wt switch` runs"
+    );
+}
+
+#[test]
+fn enter_on_the_current_worktree_is_a_noop_with_a_notice() {
+    let mut app = app_with(vec![worktree_item("main", "/repo", true)]);
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.pending.switch, None,
+        "switching to yourself would only rewrite where you already are"
+    );
+    assert!(matches!(app.mode, Mode::Normal));
+    assert!(
+        app.notice
+            .as_ref()
+            .is_some_and(|n| n.text.contains("already on")),
+        "the no-op must explain itself: {:?}",
+        app.notice
+    );
+}
+
+#[test]
+fn enter_on_a_branch_only_row_switches_by_branch() {
+    // A branch with no worktree yet: `wt switch <branch>` creates one, the
+    // same as the picker's `--branches` rows.
+    let mut branch_only = worktree_item("no-worktree", "", false);
+    branch_only.worktree = None;
+
+    let mut app = app_with(vec![branch_only]);
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.pending.switch.as_deref(), Some("no-worktree"));
+}
+
+#[test]
+fn enter_on_a_detached_row_switches_by_path() {
+    let detached = Item {
+        branch: None,
+        worktree: Some(Worktree {
+            path: Some("/repo.detached".to_string()),
+            detached: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut app = app_with(vec![detached]);
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.pending.switch.as_deref(),
+        Some("/repo.detached"),
+        "a detached worktree has no branch, so the path is the only name it has"
+    );
+}
+
+#[test]
+fn enter_with_no_visible_rows_queues_nothing() {
+    let mut app = app_with(vec![]);
+    app.on_key(key(KeyCode::Enter));
+    assert_eq!(app.pending.switch, None);
+}
+
+#[test]
+fn enter_in_the_search_view_reruns_the_query_instead_of_switching() {
+    let mut app = app_with(vec![worktree_item("main", "/repo", true)]);
+    app.view = View::Search;
+    app.search.query = "auth".to_string();
+    app.on_key(key(KeyCode::Enter));
+    assert!(
+        app.pending.search.is_some(),
+        "Enter in search re-runs the query"
+    );
+    assert_eq!(
+        app.pending.switch, None,
+        "the table must not switch while browsing results"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // PR / CI
 // ---------------------------------------------------------------------------
 

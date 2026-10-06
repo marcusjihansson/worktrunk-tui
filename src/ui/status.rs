@@ -62,16 +62,40 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                     Color::Gray
                 }),
             )),
-            None => default_line(app),
+            None => default_line(app, area.width),
         },
     };
 
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn default_line(app: &App) -> Line<'static> {
+/// Gap between two hints, chosen to read as a column at small sizes.
+const SEPARATOR: &str = "  ";
+
+/// The worktree table's key hints, most important first, with whether each is
+/// drawn in the accent colour.
+///
+/// Order is priority, because the line is clipped at the right edge on a narrow
+/// terminal and whatever sits rightmost is what disappears. `Enter` leads since
+/// switching is the table's primary action, and `q` follows immediately because
+/// losing the way out is worse than losing any of the verbs behind `?` — a
+/// user who cannot see `q` has to guess or interrupt the process.
+const HINTS: &[(&str, bool)] = &[
+    ("Enter:switch", true),
+    ("q:quit", false),
+    ("?:keys", false),
+    ("/:filter", false),
+    ("n:new", false),
+    ("d:remove", false),
+    ("m:merge", false),
+    ("P:prune", false),
+    ("s:search", false),
+];
+
+fn default_line(app: &App, width: u16) -> Line<'static> {
     // The search view's status line reports the search itself; a results
-    // summary is more useful there than a list of keybindings.
+    // summary is more useful there than a list of keybindings. It also cannot
+    // offer a switch, since Enter there re-runs the query.
     if app.view == crate::app::View::Search {
         return search_line(app);
     }
@@ -90,11 +114,32 @@ fn default_line(app: &App) -> Line<'static> {
     if app.pane == Pane::Preview {
         spans.push(Span::styled("preview focused · ", hint));
     }
-    spans.push(Span::styled(
-        "?:keys  /:filter  n:new  d:remove  m:merge  P:prune  s:search  q:quit",
-        hint,
-    ));
-    Line::from(spans)
+
+    // Everything so far is state rather than a hint, so it is never dropped:
+    // the whole point of the prefixes is to say what the view is currently
+    // doing. They are laid out first so the hints get whatever room is left.
+    let mut line = Line::from(spans);
+    let mut room = (width as usize).saturating_sub(line.width());
+
+    for (i, (text, accented)) in HINTS.iter().enumerate() {
+        let needed = text.chars().count() + if i == 0 { 0 } else { SEPARATOR.len() };
+        // Stopping at the first hint that does not fit keeps the remainder
+        // from wrapping into the next row, which would push the table up.
+        if needed > room {
+            break;
+        }
+        room -= needed;
+        // The gap is part of the same budget as the hint, so it is emitted here
+        // rather than folded into the text: measured without being drawn, the
+        // hints run together and read as one run-on word.
+        if i > 0 {
+            line.spans.push(Span::styled(SEPARATOR, hint));
+        }
+        let style = if *accented { accent } else { hint };
+        line.spans.push(Span::styled(*text, style));
+    }
+
+    line
 }
 
 /// The search status line: the query, its modifiers, and the result summary.

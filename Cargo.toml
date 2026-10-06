@@ -31,6 +31,10 @@ name = "lifecycle"
 path = "tests/lifecycle.rs"
 
 [[test]]
+name = "status"
+path = "tests/status.rs"
+
+[[test]]
 name = "live"
 path = "tests/live.rs"
 

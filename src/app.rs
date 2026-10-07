@@ -726,11 +726,10 @@ impl App {
             self.set_notice(format!("already on {}", item.label()), NoticeKind::Info);
             return;
         }
-        let target = item.branch.clone().or_else(|| {
-            item.worktree
-                .as_ref()
-                .and_then(|w| w.path.clone())
-        });
+        let target = item
+            .branch
+            .clone()
+            .or_else(|| item.worktree.as_ref().and_then(|w| w.path.clone()));
         match target {
             Some(target) => {
                 self.pending.switch = Some(target);

@@ -204,7 +204,11 @@ Two requirements, neither of which Herdr installs for you:
 
 The plugin contributes one action, `open`, which opens the dashboard as a
 temporary overlay pane over the current workspace and restores your layout when
-you quit it. To bind it to a key in `~/.config/herdr/config.toml`:
+you quit it. In a normal terminal, Enter follows Worktrunk's shell integration
+back to the selected worktree. In Herdr, the overlay captures that target and
+opens or focuses the corresponding Herdr worktree workspace, since a temporary
+pane cannot change the parent shell's directory. To bind it to a key in
+`~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
@@ -224,6 +228,22 @@ is the escape hatch if you keep your projects somewhere unusual.
 Nothing is sandboxed: like any Herdr plugin this runs as you, with your
 environment. The build command is the only code the installer runs before you
 see the dashboard, and it is a plain `cargo build`.
+
+### Updating an installed plugin
+
+The standalone `wt-tui` installed by `cargo install --path .` and the binary in
+Herdr's managed plugin checkout are separate builds. After pushing a change,
+refresh both surfaces explicitly:
+
+```
+cargo install --path .
+herdr plugin install marcusjihansson/worktrunk-tui --yes
+herdr server reload-config
+```
+
+The reinstall replaces the managed checkout; there is no separate Herdr plugin
+update command. Close an already-open dashboard before testing a refreshed
+binary, because a running process keeps the old executable in memory.
 
 ## Development
 

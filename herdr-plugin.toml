@@ -26,7 +26,8 @@ title = "Open worktrunk worktrees"
 command = ["sh", "herdr/open.sh"]
 
 # `overlay` is a temporary zoomed pane that restores the previous focus when the
-# dashboard exits, which suits a browse-and-quit TUI better than a split.
+# dashboard exits. On a successful Enter switch, run.sh hands the selected path
+# to `herdr worktree open`, which focuses or opens that worktree workspace.
 [[panes]]
 id = "dashboard"
 title = "Worktrunk worktrees"

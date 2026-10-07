@@ -35,6 +35,10 @@ name = "status"
 path = "tests/status.rs"
 
 [[test]]
+name = "herdr"
+path = "tests/herdr.rs"
+
+[[test]]
 name = "live"
 path = "tests/live.rs"
 
